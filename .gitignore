@@ -1,0 +1,9 @@
+build/
+dist/
+__pycache__/
+*.dmg
+AppIcon.icns
+AppIcon.iconset/
+logo.png
+*.pyc
+.DS_Store
