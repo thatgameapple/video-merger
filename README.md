@@ -69,3 +69,7 @@ brew install python@3.11
 ## License
 
 个人工具，自用为主。内置的 FFmpeg 二进制来自 [osxexperts.net](https://www.osxexperts.net/)，遵循 GPL/LGPL。
+
+---
+
+**v1.1** · thatgameapple

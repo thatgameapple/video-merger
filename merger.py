@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 
+VERSION = '1.1'
+AUTHOR = 'thatgameapple'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
 
@@ -353,6 +355,12 @@ class MainWindow(QMainWindow):
         self.status = QLabel('')
         self.status.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
         layout.addWidget(self.status)
+
+        # 底部署名
+        footer = QLabel(f'v{VERSION}  ·  {AUTHOR}')
+        footer.setStyleSheet(f'color: {C["fg_hint"]}; font-size: 11px;')
+        footer.setAlignment(Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(footer)
 
     def choose_folder(self):
         start = self.config.get('last_folder', str(Path.home()))
