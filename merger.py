@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -14,9 +15,33 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
-FFMPEG = '/opt/homebrew/bin/ffmpeg'
-FFPROBE = '/opt/homebrew/bin/ffprobe'
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
+
+
+def _resolve_binary(name: str) -> str:
+    candidates = []
+    if getattr(sys, 'frozen', False):
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidates.append(Path(meipass) / name)
+        candidates.append(Path(sys.executable).parent / name)
+        candidates.append(Path(sys.executable).parent.parent / 'Frameworks' / name)
+        candidates.append(Path(sys.executable).parent.parent / 'Resources' / name)
+    candidates.append(Path(__file__).parent / 'bin' / name)
+    for p in candidates:
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    found = shutil.which(name)
+    if found:
+        return found
+    for p in (f'/opt/homebrew/bin/{name}', f'/usr/local/bin/{name}'):
+        if os.access(p, os.X_OK):
+            return p
+    return name
+
+
+FFMPEG = _resolve_binary('ffmpeg')
+FFPROBE = _resolve_binary('ffprobe')
 
 # ── Purple Loop 色板 ──────────────────────────────────────────────
 C = {

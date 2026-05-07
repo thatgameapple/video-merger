@@ -2,7 +2,7 @@
 
 > Purple Loop 配套小工具。批量把分段录制的视频文件按文件名顺序无损拼成一个，方便后续做字幕识别和剪辑。
 
-PyQt6 + FFmpeg。macOS。
+PyQt6 + FFmpeg。macOS（Apple Silicon）。
 
 ## 适用场景
 
@@ -14,11 +14,9 @@ VM 用 FFmpeg 的 concat demuxer（`-c copy`）直接拼，不重编码，几乎
 
 ## 安装
 
-1. 装 FFmpeg：
-   ```bash
-   brew install ffmpeg
-   ```
-2. 从 [Releases](https://github.com/thatgameapple/video-merger/releases) 下载 `视频合并_1.0_macos.dmg`，拖进 Applications。
+从 [Releases](https://github.com/thatgameapple/video-merger/releases) 下载 `视频合并_x.x_macos.dmg`，拖进 Applications。
+
+FFmpeg 已内置，**无需额外安装任何东西**。
 
 首次打开如果被 Gatekeeper 拦，去「系统设置 → 隐私与安全性」点「仍要打开」。
 
@@ -35,9 +33,28 @@ VM 用 FFmpeg 的 concat demuxer（`-c copy`）直接拼，不重编码，几乎
 ## 从源码运行
 
 ```bash
-brew install python@3.11 ffmpeg
+brew install python@3.11
 /opt/homebrew/bin/python3.11 -m pip install PyQt6
+
+# 下载内置用的 ffmpeg/ffprobe 二进制到 bin/
+./download_ffmpeg.sh
+
 /opt/homebrew/bin/python3.11 merger.py
+```
+
+如果本机已装 ffmpeg（`brew install ffmpeg`），跳过 `download_ffmpeg.sh` 也能跑——程序会按以下顺序找：
+
+1. `.app` 内置的二进制
+2. 项目目录下 `bin/ffmpeg`
+3. 系统 `PATH`（`shutil.which`）
+4. `/opt/homebrew/bin/`、`/usr/local/bin/`
+
+## 打包 DMG
+
+```bash
+./download_ffmpeg.sh
+/opt/homebrew/bin/python3.11 -m PyInstaller merger.spec
+# 然后用 create-dmg 出 dmg
 ```
 
 ## 配置
@@ -51,4 +68,4 @@ brew install python@3.11 ffmpeg
 
 ## License
 
-个人工具，自用为主。
+个人工具，自用为主。内置的 FFmpeg 二进制来自 [osxexperts.net](https://www.osxexperts.net/)，遵循 GPL/LGPL。

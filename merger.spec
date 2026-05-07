@@ -3,7 +3,10 @@
 a = Analysis(
     ['merger.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ('bin/ffmpeg', '.'),
+        ('bin/ffprobe', '.'),
+    ],
     datas=[],
     hiddenimports=[],
     hookspath=[],

@@ -7,3 +7,4 @@ AppIcon.iconset/
 logo.png
 *.pyc
 .DS_Store
+bin/
