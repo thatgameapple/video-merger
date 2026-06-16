@@ -264,6 +264,7 @@ class MainWindow(QMainWindow):
         self.folder = None
         self.file_infos = {}
         self.config = load_config()
+        self.setAcceptDrops(True)
         self._build_ui()
 
     def _build_ui(self):
@@ -275,7 +276,7 @@ class MainWindow(QMainWindow):
 
         # 顶部：文件夹路径 + 选择按钮
         top = QHBoxLayout()
-        self.folder_label = QLabel('尚未选择文件夹')
+        self.folder_label = QLabel('尚未选择文件夹（可把文件夹拖进来）')
         self.folder_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
         self.folder_label.setWordWrap(False)
         btn_folder = QPushButton('选择文件夹')
@@ -370,12 +371,34 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, '选择视频文件夹', str(start_path))
         if not folder:
             return
-        self.folder = Path(folder)
+        self._set_folder(Path(folder))
+
+    def _set_folder(self, folder: Path):
+        self.folder = folder
         self.config['last_folder'] = str(self.folder)
         save_config(self.config)
         self.folder_label.setText(str(self.folder))
         self.folder_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
         self.load_files()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        path = Path(urls[0].toLocalFile())
+        if path.is_file():
+            path = path.parent
+        if path.is_dir():
+            self._set_folder(path)
+            event.acceptProposedAction()
 
     def load_files(self):
         self.list_widget.clear()
