@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -14,10 +15,12 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 
-VERSION = '1.2'
+VERSION = '1.3'
 AUTHOR = 'thatgameapple'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
+PATH_ROLE = Qt.ItemDataRole.UserRole          # 行里存的完整路径
+BATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 1  # 行里存的批次号（供「撤销」）
 
 
 def _resolve_binary(name: str) -> str:
@@ -216,6 +219,53 @@ def format_duration(info):
         return "?"
 
 
+# ── 懂「第几期·第几天·上午/下午/晚上」的智能排序 ───────────────────
+# 周老师课程文件名里时段词位置不统一（「左机位第二天下午」「第二天上午A」），
+# 纯文件名排序会把上午挤到后面。这里按 期→天→时段→原名 排，得到自然时间序。
+_CN_NUM = {'零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+           '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
+
+# 时段词 → 先后秩；同一时段内再按文件名排
+_PERIODS = [('凌晨', 0), ('清晨', 1), ('早晨', 2), ('早上', 2),
+            ('上午', 3), ('午前', 3), ('中午', 4), ('正午', 4), ('午间', 4),
+            ('下午', 5), ('午后', 5), ('傍晚', 6), ('黄昏', 6),
+            ('晚上', 7), ('晚间', 7), ('夜里', 7), ('夜晚', 7), ('深夜', 8)]
+
+
+def _cn_to_int(s):
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s in _CN_NUM:
+        return _CN_NUM[s]
+    if '十' in s:                       # 十一、二十、二十三 …
+        a, _, b = s.partition('十')
+        return (_CN_NUM.get(a, 1) if a else 1) * 10 + (_CN_NUM.get(b, 0) if b else 0)
+    return None
+
+
+def _num_before(name, unit):
+    """取「第X<unit>」「X<unit>」里的数字（阿拉伯或中文），无则 None。"""
+    m = re.search(r'第?\s*([0-9零一二三四五六七八九十两]+)\s*' + unit, name)
+    return _cn_to_int(m.group(1)) if m else None
+
+
+def _period_rank(name):
+    ranks = [r for kw, r in _PERIODS if kw in name]
+    return min(ranks) if ranks else 50   # 没有时段词的排在有时段词的之后
+
+
+def smart_sort_key(path):
+    name = path.name
+    qi = _num_before(name, '期')
+    day = _num_before(name, '天')
+    return (qi if qi is not None else 0,
+            day if day is not None else 0,
+            _period_rank(name),
+            name)
+
+
 class MergeWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
@@ -256,14 +306,48 @@ class MergeWorker(QThread):
             self.finished.emit(False, str(e))
 
 
+class DropListWidget(QListWidget):
+    """行内拖动可调序；外部文件/文件夹拖入则转交回调（add_paths）处理。"""
+
+    def __init__(self, on_external):
+        super().__init__()
+        self._on_external = on_external
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def _is_external(self, event):
+        return event.mimeData().hasUrls() and event.source() is not self
+
+    def dragEnterEvent(self, event):
+        if self._is_external(event):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._is_external(event):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if self._is_external(event):
+            paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.toLocalFile()]
+            if paths:
+                self._on_external(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('视频合并')
         self.setMinimumSize(720, 520)
-        self.folder = None
-        self.file_infos = {}
         self.config = load_config()
+        self._next_batch = 0   # 递增批次号，每次拖入/添加一批 +1，供「撤销」
         self.setAcceptDrops(True)
         self._build_ui()
 
@@ -276,10 +360,10 @@ class MainWindow(QMainWindow):
 
         # 顶部：文件夹路径 + 选择按钮
         top = QHBoxLayout()
-        self.folder_label = QLabel('尚未选择文件夹（可把文件夹拖进来）')
+        self.folder_label = QLabel('把视频或文件夹拖进来（或点右边添加文件夹）')
         self.folder_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
         self.folder_label.setWordWrap(False)
-        btn_folder = QPushButton('选择文件夹')
+        btn_folder = QPushButton('添加文件夹')
         btn_folder.clicked.connect(self.choose_folder)
         top.addWidget(self.folder_label, 1)
         top.addWidget(btn_folder)
@@ -293,29 +377,28 @@ class MainWindow(QMainWindow):
 
         # 操作按钮行
         btn_row = QHBoxLayout()
-        btn_all = QPushButton('全选')
-        btn_none = QPushButton('取消全选')
-        btn_all.clicked.connect(self.select_all)
-        btn_none.clicked.connect(self.select_none)
-        self.sel_label = QLabel('已选 0 个文件')
-        self.sel_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
-        btn_row.addWidget(btn_all)
-        btn_row.addWidget(btn_none)
+        self.btn_undo = QPushButton('撤销')
+        self.btn_undo.setToolTip('去掉最近添加的一批')
+        self.btn_clear = QPushButton('清空')
+        self.btn_clear.setToolTip('清空整个待合并清单')
+        self.btn_undo.clicked.connect(self.undo)
+        self.btn_clear.clicked.connect(self.clear_list)
+        self.btn_undo.setEnabled(False)
+        self.btn_clear.setEnabled(False)
+        self.count_label = QLabel('共 0 个待合并')
+        self.count_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
+        btn_row.addWidget(self.btn_undo)
+        btn_row.addWidget(self.btn_clear)
         btn_row.addStretch()
-        btn_row.addWidget(self.sel_label)
+        btn_row.addWidget(self.count_label)
         layout.addLayout(btn_row)
 
         # 文件列表
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list_widget = DropListWidget(self.add_paths)
         self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.itemSelectionChanged.connect(self.on_selection_changed)
+        # 手动拖动调序后，刷新状态（首个文件决定输出目录）
+        self.list_widget.model().rowsMoved.connect(lambda *a: self._refresh_state())
         layout.addWidget(self.list_widget, 1)
-
-        # 状态（文件数量）
-        self.file_count_label = QLabel('')
-        self.file_count_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
-        layout.addWidget(self.file_count_label)
 
         # 分割线
         line2 = QWidget()
@@ -371,15 +454,8 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, '选择视频文件夹', str(start_path))
         if not folder:
             return
-        self._set_folder(Path(folder))
-
-    def _set_folder(self, folder: Path):
-        self.folder = folder
-        self.config['last_folder'] = str(self.folder)
-        save_config(self.config)
-        self.folder_label.setText(str(self.folder))
-        self.folder_label.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
-        self.load_files()
+        if self.add_paths([Path(folder)]) == 0:
+            self.status.setText('该文件夹没有可添加的视频（或已在清单里）')
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -390,59 +466,97 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if not urls:
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.toLocalFile()]
+        if not paths:
             return
-        path = Path(urls[0].toLocalFile())
-        if path.is_file():
-            path = path.parent
-        if path.is_dir():
-            self._set_folder(path)
-            event.acceptProposedAction()
+        self.add_paths(paths)
+        event.acceptProposedAction()
 
-    def load_files(self):
-        self.list_widget.clear()
-        self.file_infos = {}
+    def _gather_videos(self, paths):
+        """把拖入/选中的路径展开成视频文件（文件夹取其中的视频），按时段智能排序。"""
+        videos = []
+        for p in paths:
+            if p.is_dir():
+                videos.extend(
+                    f for f in p.iterdir()
+                    if f.suffix.lower() in VIDEO_EXTS and not f.name.startswith('._'))
+            elif (p.is_file() and p.suffix.lower() in VIDEO_EXTS
+                  and not p.name.startswith('._')):
+                videos.append(p)
+        return sorted(videos, key=smart_sort_key)
+
+    def add_paths(self, paths):
+        """把拖入/选中的视频追加到清单末尾，去重；返回本次实际新增的数量。"""
+        videos = self._gather_videos(paths)
+        existing = {self.list_widget.item(i).data(PATH_ROLE)
+                    for i in range(self.list_widget.count())}
         self.status.setText('正在读取文件信息...')
         QApplication.processEvents()
-
-        files = sorted(
-            [f for f in self.folder.iterdir()
-             if f.suffix.lower() in VIDEO_EXTS and not f.name.startswith('._')],
-            key=lambda f: f.name
-        )
-
-        for f in files:
+        added = 0
+        bid = self._next_batch
+        for f in videos:
+            key = str(f)
+            if key in existing:
+                continue
+            existing.add(key)
             info = get_video_info(f)
-            self.file_infos[f.name] = (f, info)
             dur = format_duration(info) if info else '?'
             item = QListWidgetItem(f'  {f.name}    {dur}')
-            item.setData(Qt.ItemDataRole.UserRole, f.name)
+            item.setData(PATH_ROLE, key)
+            item.setData(BATCH_ROLE, bid)
             self.list_widget.addItem(item)
-
-        self.file_count_label.setText(f'共 {len(files)} 个视频文件')
+            added += 1
         self.status.setText('')
+        if added:
+            self._next_batch += 1
+            self.config['last_folder'] = str(videos[0].parent)
+            save_config(self.config)
+        self._refresh_state()
+        return added
 
-    def select_all(self):
-        self.list_widget.selectAll()
+    def undo(self):
+        """删掉最近添加的那一批（按批次号，手动调过序也准）。"""
+        n = self.list_widget.count()
+        ids = [b for i in range(n)
+               if (b := self.list_widget.item(i).data(BATCH_ROLE)) is not None]
+        if not ids:
+            return
+        last = max(ids)
+        for i in range(n - 1, -1, -1):
+            if self.list_widget.item(i).data(BATCH_ROLE) == last:
+                self.list_widget.takeItem(i)
+        self._refresh_state()
 
-    def select_none(self):
-        self.list_widget.clearSelection()
+    def clear_list(self):
+        self.list_widget.clear()
+        self._next_batch = 0
+        self._refresh_state()
 
-    def on_selection_changed(self):
-        n = len(self.list_widget.selectedItems())
-        self.sel_label.setText(f'已选 {n} 个文件')
+    def _refresh_state(self):
+        n = self.list_widget.count()
+        self.count_label.setText(
+            f'共 {n} 个待合并 · 可上下拖动调序' if n >= 2 else f'共 {n} 个待合并')
         self.btn_merge.setEnabled(n >= 2)
+        self.btn_undo.setEnabled(n > 0)
+        self.btn_clear.setEnabled(n > 0)
+        if n:
+            first = Path(self.list_widget.item(0).data(PATH_ROLE))
+            self.folder_label.setText(f'输出到：{first.parent}')
+        else:
+            self.folder_label.setText('把视频或文件夹拖进来（或点右边添加文件夹）')
 
     def start_merge(self):
-        selected = self.list_widget.selectedItems()
-        names = sorted(item.data(Qt.ItemDataRole.UserRole) for item in selected)
-        files = [self.file_infos[name][0] for name in names]
+        n = self.list_widget.count()
+        if n < 2:
+            return
+        files = [Path(self.list_widget.item(i).data(PATH_ROLE))
+                 for i in range(n)]
+        out_dir = files[0].parent
 
         out_name = self.out_name.text().strip() or '合并输出.mp4'
         if not out_name.endswith(('.mp4', '.mov', '.mkv')):
             out_name += '.mp4'
-        output = self.folder / out_name
+        output = out_dir / out_name
 
         if output.exists():
             reply = QMessageBox.question(
@@ -472,7 +586,6 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, success, msg):
         self.progress_bar.setVisible(False)
-        self.btn_merge.setEnabled(True)
         if success:
             deleted = False
             if self._delete_after:
@@ -488,9 +601,9 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                     deleted = True
-            # 自动归位：刷新列表 + 清掉上一批选中，方便接着合并下一个机位/下一天。
-            # 输出名与删除勾选保持不动（如「第3期第2天 左机位」只需手改成「右机位」）。
-            self.load_files()
+            # 任务完成，清空清单准备下一批；输出名与删除勾选保持不动
+            # （如「第3期第2天 左机位」只需手改成「右机位」即可接着合并）。
+            self.clear_list()
             if deleted:
                 self.status.setText('合并完成，已删除原文件')
             else:
@@ -498,6 +611,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
         else:
             self.status.setText('合并失败')
+            self.btn_merge.setEnabled(self.list_widget.count() >= 2)
             QMessageBox.critical(self, '错误', f'合并失败：\n{msg}')
 
 

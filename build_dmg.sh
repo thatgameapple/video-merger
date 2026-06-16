@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP_NAME="视频合并"
-VERSION="1.2"
+VERSION="1.3"
 DMG="${APP_NAME}_${VERSION}_macos.dmg"
 PY="/opt/homebrew/bin/python3.11"
 
