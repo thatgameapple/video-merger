@@ -474,6 +474,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self.btn_merge.setEnabled(True)
         if success:
+            deleted = False
             if self._delete_after:
                 reply = QMessageBox.warning(
                     self, '确认删除',
@@ -486,10 +487,14 @@ class MainWindow(QMainWindow):
                             f.unlink()
                         except Exception:
                             pass
-                    self.load_files()
-                    self.status.setText(f'合并完成，已删除原文件')
-                    return
-            self.status.setText(f'合并完成：{Path(msg).name}')
+                    deleted = True
+            # 自动归位：刷新列表 + 清掉上一批选中，方便接着合并下一个机位/下一天。
+            # 输出名与删除勾选保持不动（如「第3期第2天 左机位」只需手改成「右机位」）。
+            self.load_files()
+            if deleted:
+                self.status.setText('合并完成，已删除原文件')
+            else:
+                self.status.setText(f'合并完成：{Path(msg).name}')
             QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
         else:
             self.status.setText('合并失败')
