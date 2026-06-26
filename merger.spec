@@ -4,6 +4,11 @@ import os
 # arm64 静态 ffmpeg/ffprobe 太大不进 git（见 .gitignore 的 bin/）。换机或重新
 # clone 后 bin/ 是空的，若不检查，PyInstaller 只会 warning 然后静默打出「缺
 # ffmpeg 的残包」——装上后才发现合并失败。这里构建前先 fail-fast。
+# 版本号以 merger.py 的 VERSION 为唯一来源，避免 plist 与界面页脚漂移。
+import re
+with open(os.path.join(SPECPATH, 'merger.py'), encoding='utf-8') as _vf:
+    _VERSION = re.search(r"^VERSION = '([^']+)'", _vf.read(), re.M).group(1)
+
 _binaries = []
 for _fb in ('ffmpeg', 'ffprobe'):
     _fp = os.path.join(SPECPATH, 'bin', _fb)
@@ -62,8 +67,8 @@ app = BUNDLE(
     icon='AppIcon.icns',
     bundle_identifier='com.purpleloop.videomerger',
     info_plist={
-        'CFBundleShortVersionString': '1.3',
-        'CFBundleVersion': '1.3',
+        'CFBundleShortVersionString': _VERSION,
+        'CFBundleVersion': _VERSION,
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '12.0',
     },
