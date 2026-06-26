@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 
-VERSION = '1.3'
+VERSION = '1.3.1'
 AUTHOR = 'thatgameapple'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
@@ -257,13 +257,16 @@ def _period_rank(name):
 
 
 def smart_sort_key(path):
-    name = path.name
-    qi = _num_before(name, '期')
-    day = _num_before(name, '天')
+    # 用整条路径而非仅文件名：时段词常写在子文件夹名上
+    # （如「第3天/上午/clip01.mp4」「第3天/晚上/clip01.mp4」），
+    # 只看文件名会把不同时段的同名片段排到一起。
+    s = str(path)
+    qi = _num_before(s, '期')
+    day = _num_before(s, '天')
     return (qi if qi is not None else 0,
             day if day is not None else 0,
-            _period_rank(name),
-            name)
+            _period_rank(s),
+            s)
 
 
 class MergeWorker(QThread):
@@ -473,13 +476,16 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def _gather_videos(self, paths):
-        """把拖入/选中的路径展开成视频文件（文件夹取其中的视频），按时段智能排序。"""
+        """把拖入/选中的路径展开成视频文件，按时段智能排序。
+        文件夹会递归到所有子文件夹（周老师课程常按机位/天分子目录），
+        排除 macOS 的 ._ 资源叉文件。"""
         videos = []
         for p in paths:
             if p.is_dir():
                 videos.extend(
-                    f for f in p.iterdir()
-                    if f.suffix.lower() in VIDEO_EXTS and not f.name.startswith('._'))
+                    f for f in p.rglob('*')
+                    if f.is_file() and f.suffix.lower() in VIDEO_EXTS
+                    and not f.name.startswith('._'))
             elif (p.is_file() and p.suffix.lower() in VIDEO_EXTS
                   and not p.name.startswith('._')):
                 videos.append(p)
