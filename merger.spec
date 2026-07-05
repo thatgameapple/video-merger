@@ -38,7 +38,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='视频合并',
+    name='Video Merge',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -58,12 +58,12 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='视频合并',
+    name='Video Merge',
 )
 
 app = BUNDLE(
     coll,
-    name='视频合并.app',
+    name='Video Merge.app',
     icon='AppIcon.icns',
     bundle_identifier='com.purpleloop.videomerger',
     info_plist={

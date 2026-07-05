@@ -1,4 +1,4 @@
-# 视频合并工具 VM
+# Video Merge（VM）
 
 > Purple Loop 配套小工具。把分段录制的视频拖进来即成「待合并清单」，按时段智能排序后无损拼成一个，方便后续做字幕识别和剪辑。
 
@@ -14,7 +14,7 @@ VM 用 FFmpeg 的 concat demuxer（`-c copy`）直接拼，不重编码，几乎
 
 ## 安装
 
-从 [Releases](https://github.com/thatgameapple/video-merger/releases) 下载 `视频合并_x.x_macos.dmg`，拖进 Applications。
+从 [Releases](https://github.com/thatgameapple/video-merger/releases) 下载 `Video Merge_x.x_macos.dmg`，拖进 Applications。
 
 FFmpeg 已内置，**无需额外安装任何东西**。
 
@@ -27,8 +27,10 @@ FFmpeg 已内置，**无需额外安装任何东西**。
 1. 拖入视频 / 文件夹（或点「添加文件夹」）。拖文件夹会**递归**把里面（含子文件夹，如「某天/上午、下午、晚上」）的视频整批加进来；`._` 元数据文件已过滤
 2. 清单按 **第几期 → 第几天 → 上午/下午/晚上** 智能排序（认中文数字）；排不准时**直接上下拖动行**手动调序
 3. 拖错 / 多拖了点「撤销」去掉最近一批；想重来点「清空」
-4. 设置输出文件名 → 点「开始合并」（合并文件落在清单里第一个文件所在的文件夹）
+4. 设置输出文件名 → 点「开始合并」（合并文件落在清单里第一个文件所在的文件夹）；合并时进度条按时长实时推进
 5. （可选）勾选「合并后删除原文件」，会有二次确认
+
+> 点合并时会先比对各片段的编码 / 分辨率 / 像素格式，不一致会弹窗提示（`-c copy` 混不同参数可能失败或花屏），你可以看清差异后再决定是否继续。
 
 合并成功后清单自动清空、准备下一批，**输出名保留不动**（如「第3期第2天 左机位」只需手改成「右机位」即可接着合并）。
 
@@ -68,7 +70,7 @@ brew install python@3.11
 ## 同系列工具
 
 - Purple Loop —— 主工具
-- VM（本项目）—— 视频合并
+- Video Merge / VM（本项目）—— 无损把分段视频拼成一条
 
 ## License
 
@@ -76,4 +78,4 @@ brew install python@3.11
 
 ---
 
-**v1.3.1** · thatgameapple
+**v1.4.0** · thatgameapple

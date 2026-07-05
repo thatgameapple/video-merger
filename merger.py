@@ -15,12 +15,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPalette, QColor
 
-VERSION = '1.3.1'
+VERSION = '1.4.0'
 AUTHOR = 'thatgameapple'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
 PATH_ROLE = Qt.ItemDataRole.UserRole          # 行里存的完整路径
 BATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 1  # 行里存的批次号（供「撤销」）
+PARAMS_ROLE = int(Qt.ItemDataRole.UserRole) + 2  # 视频流关键参数 (codec,w,h,pix_fmt)，合并前校验一致性
+SECS_ROLE = int(Qt.ItemDataRole.UserRole) + 3   # 时长（秒），求和得总时长供真实进度
 
 
 def _resolve_binary(name: str) -> str:
@@ -219,6 +221,41 @@ def format_duration(info):
         return "?"
 
 
+def duration_secs(info):
+    try:
+        return float(info['format']['duration'])
+    except Exception:
+        return 0.0
+
+
+def stream_params(info):
+    """取视频流的关键参数 (codec, 宽, 高, 像素格式)，供合并前比对一致性。
+    concat -c copy 要求各片段这些参数一致，否则会失败或产出花屏。"""
+    if not info:
+        return None
+    for s in info.get('streams', []):
+        if s.get('codec_type') == 'video':
+            return (s.get('codec_name'), s.get('width'),
+                    s.get('height'), s.get('pix_fmt'))
+    return None
+
+
+def describe_params(p):
+    if not p:
+        return '未知'
+    codec, w, h, pix = p
+    return f'{codec or "?"}  {w or "?"}×{h or "?"}  {pix or "?"}'
+
+
+def _parse_hms(s):
+    """'00:00:12.345000' → 12.345 秒；解析失败返回 None。"""
+    try:
+        h, m, rest = s.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(rest)
+    except Exception:
+        return None
+
+
 # ── 懂「第几期·第几天·上午/下午/晚上」的智能排序 ───────────────────
 # 周老师课程文件名里时段词位置不统一（「左机位第二天下午」「第二天上午A」），
 # 纯文件名排序会把上午挤到后面。这里按 期→天→时段→原名 排，得到自然时间序。
@@ -270,13 +307,15 @@ def smart_sort_key(path):
 
 
 class MergeWorker(QThread):
-    progress = pyqtSignal(str)
+    # 百分比 0-100；-1 表示无法估算总时长，走不确定进度（转圈）
+    progress = pyqtSignal(int)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, files, output):
+    def __init__(self, files, output, total_dur=0.0):
         super().__init__()
         self.files = files
         self.output = output
+        self.total_dur = total_dur
         self._proc = None
 
     def stop(self):
@@ -284,6 +323,7 @@ class MergeWorker(QThread):
             self._proc.terminate()
 
     def run(self):
+        list_file = err_file = None
         try:
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
                                              delete=False, encoding='utf-8') as f:
@@ -292,21 +332,55 @@ class MergeWorker(QThread):
                     f.write(f"file '{escaped}'\n")
                 list_file = f.name
 
-            self.progress.emit('正在合并...')
+            self.progress.emit(0 if self.total_dur > 0 else -1)
+            # -progress pipe:1 让 ffmpeg 周期性吐出 out_time；stderr 另存文件，
+            # 失败时读回尾部报错（避免 PIPE 塞满死锁）。
             cmd = [
-                FFMPEG, '-y', '-f', 'concat', '-safe', '0',
-                '-i', list_file, '-c', 'copy', str(self.output)
+                FFMPEG, '-y', '-f', 'concat', '-safe', '0', '-i', list_file,
+                '-c', 'copy', '-progress', 'pipe:1', '-nostats', str(self.output)
             ]
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            _, stderr = self._proc.communicate()
-            os.unlink(list_file)
+            errf = tempfile.NamedTemporaryFile(mode='w+', suffix='.log',
+                                               delete=False, encoding='utf-8')
+            err_file = errf.name
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=errf, text=True)
+
+            last = 0
+            for line in self._proc.stdout:
+                line = line.strip()
+                sec = None
+                if line.startswith(('out_time_us=', 'out_time_ms=')):
+                    v = line.split('=', 1)[1]
+                    if v.isdigit():           # 这两个键单位都是微秒
+                        sec = int(v) / 1_000_000
+                elif line.startswith('out_time='):
+                    sec = _parse_hms(line.split('=', 1)[1])
+                if sec is not None and self.total_dur > 0:
+                    pct = max(0, min(99, int(sec / self.total_dur * 100)))
+                    if pct != last:
+                        last = pct
+                        self.progress.emit(pct)
+            self._proc.stdout.close()
+            self._proc.wait()
+
+            errf.seek(0)
+            err = errf.read()
+            errf.close()
 
             if self._proc.returncode == 0:
+                self.progress.emit(100)
                 self.finished.emit(True, str(self.output))
             else:
-                self.finished.emit(False, stderr.decode()[-500:])
+                self.finished.emit(False, (err[-500:] or '未知错误'))
         except Exception as e:
             self.finished.emit(False, str(e))
+        finally:
+            for p in (list_file, err_file):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
 
 
 class DropListWidget(QListWidget):
@@ -347,7 +421,7 @@ class DropListWidget(QListWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('视频合并')
+        self.setWindowTitle('Video Merge')
         self.setMinimumSize(720, 520)
         self.config = load_config()
         self._next_batch = 0   # 递增批次号，每次拖入/添加一批 +1，供「撤销」
@@ -510,6 +584,8 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f'  {f.name}    {dur}')
             item.setData(PATH_ROLE, key)
             item.setData(BATCH_ROLE, bid)
+            item.setData(PARAMS_ROLE, stream_params(info))
+            item.setData(SECS_ROLE, duration_secs(info))
             self.list_widget.addItem(item)
             added += 1
         self.status.setText('')
@@ -573,16 +649,48 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        # 编码一致性校验：concat -c copy 要求各片段编码/分辨率一致，
+        # 否则会失败或产出花屏。不一致时列出差异让用户自己决定。
+        params = [self.list_widget.item(i).data(PARAMS_ROLE) for i in range(n)]
+        kinds = []
+        for p in params:
+            if p and p not in kinds:
+                kinds.append(p)
+        if len(kinds) > 1:
+            listed = '\n'.join(f'· {describe_params(p)}' for p in kinds)
+            reply = QMessageBox.warning(
+                self, '编码不一致',
+                '这些片段的编码 / 分辨率 / 像素格式不完全一致，'
+                '无损合并（-c copy）可能失败或产生花屏：\n\n'
+                f'{listed}\n\n'
+                '建议只合并同一次录制切出的片段。仍要合并吗？',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        total_dur = sum(self.list_widget.item(i).data(SECS_ROLE) or 0
+                        for i in range(n))
         self._merged_files = files
         self._delete_after = self.delete_check.isChecked()
         self.btn_merge.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.status.setText('正在合并，请稍候...')
 
-        self.worker = MergeWorker(files, output)
-        self.worker.progress.connect(self.status.setText)
+        self.worker = MergeWorker(files, output, total_dur)
+        self.worker.progress.connect(self.on_progress)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
+
+    def on_progress(self, pct):
+        if pct < 0:                       # 无法估算总时长 → 不确定进度（转圈）
+            self.progress_bar.setRange(0, 0)
+            self.status.setText('正在合并，请稍候...')
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(pct)
+            self.status.setText(f'正在合并… {pct}%')
 
     def closeEvent(self, event):
         if hasattr(self, 'worker') and self.worker.isRunning():
