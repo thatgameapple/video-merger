@@ -10,13 +10,15 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
-    QProgressBar, QLineEdit, QMessageBox, QAbstractItemView, QCheckBox
+    QProgressBar, QLineEdit, QMessageBox, QAbstractItemView, QCheckBox,
+    QDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPalette, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont, QPalette, QColor, QAction
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 AUTHOR = 'thatgameapple'
+APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
 PATH_ROLE = Qt.ItemDataRole.UserRole          # 行里存的完整路径
@@ -427,6 +429,99 @@ class MainWindow(QMainWindow):
         self._next_batch = 0   # 递增批次号，每次拖入/添加一批 +1，供「撤销」
         self.setAcceptDrops(True)
         self._build_ui()
+        self._build_appmenu()
+
+    def _build_appmenu(self):
+        """「帮助」菜单里放「关于 Video Merge」→ 弹品牌卡片。用 NoRole 显式阻止 Qt 的
+        文本启发式把它当 AboutRole 合并进应用菜单——实测打包版合并后那个项反而
+        不触发我们的槽（关于卡片打不开），且帮助菜单会整个消失。NoRole 让它老实
+        留在帮助菜单，纯 Qt signal 触发，开发/打包都稳定（PL 也是从帮助菜单打开
+        关于）。原生的「服务/隐藏/退出」由系统提供。"""
+        mb = self.menuBar()
+        hm = mb.addMenu('帮助')
+        about = QAction(f'关于 {APP_NAME}', self)
+        about.setMenuRole(QAction.MenuRole.NoRole)
+        about.triggered.connect(self._open_about)
+        hm.addAction(about)
+        # 删掉 Qt 往应用菜单塞的英文/无用默认项（About Qt、首选项）
+        QTimer.singleShot(0, self._localize_native_appmenu)
+
+    def _open_about(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'关于 {APP_NAME}')
+        dlg.setFixedWidth(340)
+        dlg.setStyleSheet(f"QDialog {{ background: {C['bg']}; }}")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(30, 28, 30, 26)
+        lay.setSpacing(5)
+
+        def _lbl(text, size, color, family='PingFang SC'):
+            l = QLabel(text)
+            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            l.setStyleSheet(f"color:{color}; font-size:{size}px; font-family:'{family}';")
+            return l
+
+        lay.addWidget(_lbl(APP_NAME, 21, C['accent']))
+        lay.addWidget(_lbl(f'v{VERSION}', 12, C['fg_dim']))
+        lay.addSpacing(12)
+        lay.addWidget(_lbl('专为剪辑设计的视频无损合并工具', 12, C['fg']))
+        lay.addWidget(_lbl('无损拼接 · 编码校验 · 服务 PR 剪辑', 11, C['fg_dim']))
+        lay.addSpacing(14)
+        lay.addWidget(_lbl(f'© 2026 · {AUTHOR}', 10, C['fg_dim']))
+        dlg.exec()
+
+    def _localize_native_appmenu(self):
+        """删掉 Qt 往 macOS 应用菜单塞的英文/无用默认项（About Qt、首选项），并整理分隔线。
+        纯锦上添花——用 ObjC 运行时直接改原生菜单；任何异常都静默跳过，绝不影响启动。"""
+        try:
+            import ctypes, ctypes.util
+            objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.objc_getClass.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+            def msg(o, s, *a, rt=ctypes.c_void_p, at=None):
+                objc.objc_msgSend.restype = rt
+                objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p] + (at or [])
+                return objc.objc_msgSend(o, objc.sel_registerName(s.encode()), *a)
+
+            NSApp = msg(objc.objc_getClass(b'NSApplication'), 'sharedApplication')
+            appmenu = msg(msg(msg(NSApp, 'mainMenu'),
+                              'itemAtIndex:', 0, at=[ctypes.c_long]), 'submenu')
+            if not appmenu:
+                return
+
+            def titles():
+                n = msg(appmenu, 'numberOfItems', rt=ctypes.c_long)
+                out = []
+                for i in range(n):
+                    u = msg(msg(msg(appmenu, 'itemAtIndex:', i, at=[ctypes.c_long]),
+                                'title'), 'UTF8String', rt=ctypes.c_char_p)
+                    out.append(u.decode() if u else '')
+                return out
+
+            for target in ('About Qt', '首选项...', 'Preferences...'):
+                for i, t in enumerate(titles()):
+                    if t == target:
+                        msg(appmenu, 'removeItemAtIndex:', i, at=[ctypes.c_long])
+                        break
+
+            # 整理分隔线：去掉开头的、以及连续重复的分隔线
+            i = 0
+            while i < msg(appmenu, 'numberOfItems', rt=ctypes.c_long):
+                it = msg(appmenu, 'itemAtIndex:', i, at=[ctypes.c_long])
+                is_sep = bool(msg(it, 'isSeparatorItem', rt=ctypes.c_bool))
+                prev_sep = (i == 0)
+                if i > 0:
+                    pit = msg(appmenu, 'itemAtIndex:', i - 1, at=[ctypes.c_long])
+                    prev_sep = bool(msg(pit, 'isSeparatorItem', rt=ctypes.c_bool))
+                if is_sep and prev_sep:
+                    msg(appmenu, 'removeItemAtIndex:', i, at=[ctypes.c_long])
+                else:
+                    i += 1
+        except Exception:
+            pass
 
     def _build_ui(self):
         central = QWidget()
