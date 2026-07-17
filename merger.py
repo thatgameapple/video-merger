@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QPalette, QColor, QAction
 
-VERSION = '1.4.1'
+VERSION = '1.4.2'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
@@ -205,10 +205,15 @@ def get_video_info(path):
         FFPROBE, '-v', 'quiet', '-print_format', 'json',
         '-show_streams', '-show_format', str(path)
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    # ffprobe 缺失、文件损坏、输出不是 JSON 都只当「读不出信息」，
+    # 一律返回 None 让上层显示「?」，不能让拖入动作整个崩掉。
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except Exception:
         return None
-    return json.loads(result.stdout)
 
 
 def format_duration(info):
@@ -319,8 +324,10 @@ class MergeWorker(QThread):
         self.output = output
         self.total_dur = total_dur
         self._proc = None
+        self._cancelled = False
 
     def stop(self):
+        self._cancelled = True
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
 
@@ -373,8 +380,15 @@ class MergeWorker(QThread):
                 self.progress.emit(100)
                 self.finished.emit(True, str(self.output))
             else:
-                self.finished.emit(False, (err[-500:] or '未知错误'))
+                # 失败/取消时 ffmpeg 已经写了个残缺文件在素材目录里，
+                # 留着会被下次拖入当成素材，直接清掉。
+                self._discard_partial()
+                if self._cancelled:
+                    self.finished.emit(False, '已取消')
+                else:
+                    self.finished.emit(False, (err[-500:] or '未知错误'))
         except Exception as e:
+            self._discard_partial()
             self.finished.emit(False, str(e))
         finally:
             for p in (list_file, err_file):
@@ -383,6 +397,12 @@ class MergeWorker(QThread):
                         os.unlink(p)
                     except Exception:
                         pass
+
+    def _discard_partial(self):
+        try:
+            Path(self.output).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 class DropListWidget(QListWidget):
@@ -427,6 +447,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(720, 520)
         self.config = load_config()
         self._next_batch = 0   # 递增批次号，每次拖入/添加一批 +1，供「撤销」
+        self._merging = False  # 合并中：拦住「开始合并」，否则两个 ffmpeg 会抢写同一输出
+        self._adding = False   # 读取信息中：拦住重入，否则两批会共用一个批次号
         self.setAcceptDrops(True)
         self._build_ui()
         self._build_appmenu()
@@ -662,6 +684,17 @@ class MainWindow(QMainWindow):
 
     def add_paths(self, paths):
         """把拖入/选中的视频追加到清单末尾，去重；返回本次实际新增的数量。"""
+        if self._adding:            # 读取信息时 processEvents 会让新的拖入重入这里
+            return 0
+        self._adding = True
+        self._refresh_state()      # 读取期间先按住「开始合并」，清单还没长齐
+        try:
+            return self._add_paths(paths)
+        finally:
+            self._adding = False
+            self._refresh_state()
+
+    def _add_paths(self, paths):
         videos = self._gather_videos(paths)
         existing = {self.list_widget.item(i).data(PATH_ROLE)
                     for i in range(self.list_widget.count())}
@@ -669,11 +702,16 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         added = 0
         bid = self._next_batch
-        for f in videos:
+        todo = [f for f in videos if str(f) not in existing]
+        for idx, f in enumerate(todo, 1):
             key = str(f)
             if key in existing:
                 continue
             existing.add(key)
+            # 每个文件都要跑一次 ffprobe，一整天课几十个片段会读上好几秒；
+            # 报进度 + 让出事件循环，免得看起来像卡死。
+            self.status.setText(f'正在读取文件信息... {idx}/{len(todo)}')
+            QApplication.processEvents()
             info = get_video_info(f)
             dur = format_duration(info) if info else '?'
             item = QListWidgetItem(f'  {f.name}    {dur}')
@@ -688,7 +726,6 @@ class MainWindow(QMainWindow):
             self._next_batch += 1
             self.config['last_folder'] = str(videos[0].parent)
             save_config(self.config)
-        self._refresh_state()
         return added
 
     def undo(self):
@@ -713,7 +750,7 @@ class MainWindow(QMainWindow):
         n = self.list_widget.count()
         self.count_label.setText(
             f'共 {n} 个待合并 · 可上下拖动调序' if n >= 2 else f'共 {n} 个待合并')
-        self.btn_merge.setEnabled(n >= 2)
+        self.btn_merge.setEnabled(n >= 2 and not self._merging and not self._adding)
         self.btn_undo.setEnabled(n > 0)
         self.btn_clear.setEnabled(n > 0)
         if n:
@@ -722,9 +759,19 @@ class MainWindow(QMainWindow):
         else:
             self.folder_label.setText('把视频或文件夹拖进来（或点右边添加文件夹）')
 
+    @staticmethod
+    def _same_file(a, b):
+        """同一个文件？output 通常还不存在，samefile 会抛，退回比对绝对路径。"""
+        try:
+            return a.resolve() == b.resolve()
+        except Exception:
+            return os.path.abspath(a) == os.path.abspath(b)
+
     def start_merge(self):
+        # _adding 期间清单还在长（读取时 processEvents 会放行点击），
+        # 这时候合出来的会是半份清单。
         n = self.list_widget.count()
-        if n < 2:
+        if n < 2 or self._merging or self._adding:
             return
         files = [Path(self.list_widget.item(i).data(PATH_ROLE))
                  for i in range(n)]
@@ -734,6 +781,15 @@ class MainWindow(QMainWindow):
         if not out_name.endswith(('.mp4', '.mov', '.mkv')):
             out_name += '.mp4'
         output = out_dir / out_name
+
+        # 输出名撞上清单里的素材 → ffmpeg 会边读边写，把这个原文件毁掉。
+        # 拦在这里，不给「覆盖吗」的机会。
+        if any(self._same_file(f, output) for f in files):
+            QMessageBox.critical(
+                self, '输出名与素材重名',
+                f'「{out_name}」正是待合并清单里的一个原文件，'
+                '这样合并会把它边读边写、直接损坏。\n\n请换一个输出文件名。')
+            return
 
         if output.exists():
             reply = QMessageBox.question(
@@ -769,6 +825,7 @@ class MainWindow(QMainWindow):
                         for i in range(n))
         self._merged_files = files
         self._delete_after = self.delete_check.isChecked()
+        self._merging = True
         self.btn_merge.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.status.setText('正在合并，请稍候...')
@@ -789,14 +846,33 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if hasattr(self, 'worker') and self.worker.isRunning():
+            # 先断信号：窗口马上就销毁了，晚到的 finished 打进来会崩。
+            try:
+                self.worker.progress.disconnect()
+                self.worker.finished.disconnect()
+            except TypeError:
+                pass
             self.worker.stop()
             self.worker.wait(2000)
         event.accept()
 
+    def _delete_originals(self):
+        """删除原文件，返回 (成功数, 失败的文件名)。删不掉要如实说，不能谎报。"""
+        failed = []
+        ok = 0
+        for f in self._merged_files:
+            try:
+                f.unlink()
+                ok += 1
+            except Exception:
+                failed.append(f.name)
+        return ok, failed
+
     def on_finished(self, success, msg):
+        self._merging = False
         self.progress_bar.setVisible(False)
         if success:
-            deleted = False
+            done_note = f'合并完成：{Path(msg).name}'
             if self._delete_after:
                 reply = QMessageBox.warning(
                     self, '确认删除',
@@ -804,23 +880,27 @@ class MainWindow(QMainWindow):
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    for f in self._merged_files:
-                        try:
-                            f.unlink()
-                        except Exception:
-                            pass
-                    deleted = True
+                    ok, failed = self._delete_originals()
+                    if failed:
+                        done_note = f'合并完成，已删除 {ok} 个，{len(failed)} 个没删掉'
+                        QMessageBox.warning(
+                            self, '部分原文件没删掉',
+                            '这些文件删除失败（可能被占用或无权限），还在原处：\n\n'
+                            + '\n'.join(f'· {n}' for n in failed[:10])
+                            + ('\n…' if len(failed) > 10 else ''))
+                    else:
+                        done_note = f'合并完成，已删除 {ok} 个原文件'
             # 任务完成，清空清单准备下一批；输出名与删除勾选保持不动
             # （如「第3期第2天 左机位」只需手改成「右机位」即可接着合并）。
             self.clear_list()
-            if deleted:
-                self.status.setText('合并完成，已删除原文件')
-            else:
-                self.status.setText(f'合并完成：{Path(msg).name}')
+            self.status.setText(done_note)
             QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
         else:
+            self._refresh_state()
+            if msg == '已取消':
+                self.status.setText('已取消')
+                return
             self.status.setText('合并失败')
-            self.btn_merge.setEnabled(self.list_widget.count() >= 2)
             QMessageBox.critical(self, '错误', f'合并失败：\n{msg}')
 
 
