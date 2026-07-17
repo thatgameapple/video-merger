@@ -16,14 +16,15 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QPalette, QColor, QAction
 
-VERSION = '1.4.2'
+VERSION = '1.5.0'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
 CONFIG_FILE = Path.home() / '.video_merger_config.json'
+DEFAULT_OUT_NAME = '合并输出.mp4'
 PATH_ROLE = Qt.ItemDataRole.UserRole          # 行里存的完整路径
 BATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 1  # 行里存的批次号（供「撤销」）
-PARAMS_ROLE = int(Qt.ItemDataRole.UserRole) + 2  # 视频流关键参数 (codec,w,h,pix_fmt)，合并前校验一致性
+PARAMS_ROLE = int(Qt.ItemDataRole.UserRole) + 2  # 视频+音频关键参数，合并前校验一致性
 SECS_ROLE = int(Qt.ItemDataRole.UserRole) + 3   # 时长（秒），求和得总时长供真实进度
 
 
@@ -112,6 +113,10 @@ QLineEdit {{
 QLineEdit:focus {{
     border: 1px solid {C['accent']};
 }}
+QLineEdit:disabled {{
+    color: {C['fg_dim']};
+    background-color: {C['bg_panel']};
+}}
 QPushButton {{
     background-color: {C['btn_bg']};
     color: {C['btn_fg']};
@@ -143,6 +148,24 @@ QPushButton#btn_merge:hover {{
 QPushButton#btn_merge:disabled {{
     background-color: #1a4035;
     color: #4a7a68;
+}}
+/* 合并进行中，同一个按钮切成「取消合并」 */
+QPushButton#btn_cancel {{
+    background-color: {C['btn_bg']};
+    color: {C['danger']};
+    border: 1px solid {C['danger']};
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: bold;
+    padding: 10px;
+}}
+QPushButton#btn_cancel:hover {{
+    background-color: #3a2a30;
+}}
+QPushButton#btn_cancel:disabled {{
+    color: {C['fg_dim']};
+    border-color: {C['border']};
+    background-color: {C['bg_input']};
 }}
 QCheckBox {{
     color: {C['danger']};
@@ -236,22 +259,45 @@ def duration_secs(info):
 
 
 def stream_params(info):
-    """取视频流的关键参数 (codec, 宽, 高, 像素格式)，供合并前比对一致性。
-    concat -c copy 要求各片段这些参数一致，否则会失败或产出花屏。"""
+    """取视频流 (codec, 宽, 高, 像素格式) + 音频流 (codec, 采样率, 声道)，
+    供合并前比对一致性。concat -c copy 要求这些参数一致：
+    视频不一致会失败或花屏；音频不一致更阴——ffmpeg 照样返回成功，
+    只在 stderr 刷 Non-monotonic DTS，产出音轨比视频短，音画不同步。"""
     if not info:
         return None
+    video = audio = None
     for s in info.get('streams', []):
-        if s.get('codec_type') == 'video':
-            return (s.get('codec_name'), s.get('width'),
-                    s.get('height'), s.get('pix_fmt'))
-    return None
+        kind = s.get('codec_type')
+        if kind == 'video' and video is None:
+            video = (s.get('codec_name'), s.get('width'),
+                     s.get('height'), s.get('pix_fmt'))
+        elif kind == 'audio' and audio is None:
+            audio = (s.get('codec_name'), s.get('sample_rate'),
+                     s.get('channels'))
+    return (video, audio)
 
 
 def describe_params(p):
     if not p:
         return '未知'
-    codec, w, h, pix = p
-    return f'{codec or "?"}  {w or "?"}×{h or "?"}  {pix or "?"}'
+    video, audio = p
+    if video:
+        codec, w, h, pix = video
+        vs = f'{codec or "?"}  {w or "?"}×{h or "?"}  {pix or "?"}'
+    else:
+        vs = '无视频轨'
+    if audio:
+        codec, rate, ch = audio
+        vs += f'   ·   {codec or "?"}  {rate or "?"}Hz  {ch or "?"}声道'
+    else:
+        vs += '   ·   无音频轨'
+    return vs
+
+
+def _short_path(p):
+    """外接盘路径太长，界面上只显示末两级，全路径挂 tooltip。"""
+    parts = Path(p).parts
+    return '…/' + '/'.join(parts[-2:]) if len(parts) > 3 else str(p)
 
 
 def _parse_hms(s):
@@ -313,10 +359,38 @@ def smart_sort_key(path):
             s)
 
 
+# ffmpeg 返回 0 也未必干净。事前的参数校验拦不住未知情况，这是第二道防线。
+# 这些一出现就是真问题，不看条数。
+_HARD_PATTERNS = ('corrupt', 'Invalid data found', 'could not find codec parameters',
+                  'Application provided invalid')
+_DTS_PATTERNS = ('non-monotonic dts', 'dts out of order', 'invalid timestamp')
+
+
+def scan_warnings(err, junctions=0):
+    """从 ffmpeg stderr 里挑出值得报的警告，最多 5 条。
+
+    时间戳警告要按条数判，不能见一条就报：AAC 帧长和视频时长对不齐，
+    每个拼接点冒 1 条是正常的（实测干净素材 2 片段=1 条、3 片段=2 条），
+    见一条就弹框等于每次正常合并都喊狼来了。真出事时是每个音频包都报
+    （同样 2 片段，音频参数不一致实测 12 条）。按拼接点放行正常量，超了才报。"""
+    lines = err.splitlines()
+    hits = []
+    dts = [l.strip() for l in lines
+           if any(p in l.lower() for p in _DTS_PATTERNS)]
+    if len(dts) > max(2 * junctions, 2):
+        hits.append(f'{len(dts)} 条时间戳警告，音画可能不同步。例如：\n{dts[0]}')
+    for pat in _HARD_PATTERNS:
+        for l in lines:
+            if pat.lower() in l.lower():
+                hits.append(l.strip())
+                break
+    return hits[:5]
+
+
 class MergeWorker(QThread):
     # 百分比 0-100；-1 表示无法估算总时长，走不确定进度（转圈）
     progress = pyqtSignal(int)
-    finished = pyqtSignal(bool, str)
+    finished = pyqtSignal(bool, str, str)   # 成功?, 输出路径/错误, 警告文本
 
     def __init__(self, files, output, total_dur=0.0):
         super().__init__()
@@ -378,18 +452,19 @@ class MergeWorker(QThread):
 
             if self._proc.returncode == 0:
                 self.progress.emit(100)
-                self.finished.emit(True, str(self.output))
+                self.finished.emit(True, str(self.output),
+                                   '\n'.join(scan_warnings(err, len(self.files) - 1)))
             else:
                 # 失败/取消时 ffmpeg 已经写了个残缺文件在素材目录里，
                 # 留着会被下次拖入当成素材，直接清掉。
                 self._discard_partial()
                 if self._cancelled:
-                    self.finished.emit(False, '已取消')
+                    self.finished.emit(False, '已取消', '')
                 else:
-                    self.finished.emit(False, (err[-500:] or '未知错误'))
+                    self.finished.emit(False, (err[-500:] or '未知错误'), '')
         except Exception as e:
             self._discard_partial()
-            self.finished.emit(False, str(e))
+            self.finished.emit(False, str(e), '')
         finally:
             for p in (list_file, err_file):
                 if p:
@@ -449,6 +524,10 @@ class MainWindow(QMainWindow):
         self._next_batch = 0   # 递增批次号，每次拖入/添加一批 +1，供「撤销」
         self._merging = False  # 合并中：拦住「开始合并」，否则两个 ffmpeg 会抢写同一输出
         self._adding = False   # 读取信息中：拦住重入，否则两批会共用一个批次号
+        self._src_name = ''       # 第一批拖入的来源名，仅供顶部显示
+        self._out_dir = None      # 输出目录；None = 还没有清单，等第一批拖入来定
+        self._dir_chosen = False  # 用户自己选过输出目录 → 后续拖入不再改动它
+        self._name_edited = False # 用户手打过输出名 → 不再套默认名
         self.setAcceptDrops(True)
         self._build_ui()
         self._build_appmenu()
@@ -576,7 +655,8 @@ class MainWindow(QMainWindow):
         self.btn_clear = QPushButton('清空')
         self.btn_clear.setToolTip('清空整个待合并清单')
         self.btn_undo.clicked.connect(self.undo)
-        self.btn_clear.clicked.connect(self.clear_list)
+        # 走 lambda：clicked 会把 checked=False 当成 reset_output 传进去
+        self.btn_clear.clicked.connect(lambda: self.clear_list(reset_output=True))
         self.btn_undo.setEnabled(False)
         self.btn_clear.setEnabled(False)
         self.count_label = QLabel('共 0 个待合并')
@@ -600,12 +680,28 @@ class MainWindow(QMainWindow):
         line2.setStyleSheet(f'background: {C["border"]};')
         layout.addWidget(line2)
 
+        # 输出到（目录）
+        dir_row = QHBoxLayout()
+        dir_lbl = QLabel('输出到')
+        dir_lbl.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
+        dir_row.addWidget(dir_lbl)
+        self.out_dir_label = QLabel('—')
+        self.out_dir_label.setStyleSheet(f'color: {C["fg"]}; font-size: 12px;')
+        dir_row.addWidget(self.out_dir_label, 1)
+        self.btn_out_dir = QPushButton('更改')
+        self.btn_out_dir.setToolTip('自己选一个输出位置')
+        self.btn_out_dir.clicked.connect(self.choose_out_dir)
+        dir_row.addWidget(self.btn_out_dir)
+        layout.addLayout(dir_row)
+
         # 输出文件名
         out_row = QHBoxLayout()
         lbl = QLabel('输出文件名')
         lbl.setStyleSheet(f'color: {C["fg_dim"]}; font-size: 12px;')
         out_row.addWidget(lbl)
-        self.out_name = QLineEdit('合并输出.mp4')
+        self.out_name = QLineEdit(DEFAULT_OUT_NAME)
+        # 只认手打（setText 不触发 textEdited），手改过就不再被默认名覆盖
+        self.out_name.textEdited.connect(lambda *_: setattr(self, '_name_edited', True))
         out_row.addWidget(self.out_name, 1)
         layout.addLayout(out_row)
 
@@ -618,7 +714,7 @@ class MainWindow(QMainWindow):
         self.btn_merge.setObjectName('btn_merge')
         self.btn_merge.setEnabled(False)
         self.btn_merge.setFixedHeight(46)
-        self.btn_merge.clicked.connect(self.start_merge)
+        self.btn_merge.clicked.connect(self._on_merge_clicked)
         layout.addWidget(self.btn_merge)
 
         # 进度条
@@ -651,6 +747,21 @@ class MainWindow(QMainWindow):
         if self.add_paths([Path(folder)]) == 0:
             self.status.setText('该文件夹没有可添加的视频（或已在清单里）')
 
+    def choose_out_dir(self):
+        start = str(self._out_dir) if self._out_dir else self.config.get(
+            'last_out_dir', str(Path.home()))
+        start_path = Path(start)
+        while start_path != start_path.parent and not start_path.exists():
+            start_path = start_path.parent
+        folder = QFileDialog.getExistingDirectory(self, '输出到哪个文件夹', str(start_path))
+        if not folder:
+            return
+        self._out_dir = Path(folder)
+        self._dir_chosen = True          # 自己选过就别再被拖入的默认值顶掉
+        self.config['last_out_dir'] = folder
+        save_config(self.config)
+        self._refresh_state()
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -667,20 +778,32 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def _gather_videos(self, paths):
-        """把拖入/选中的路径展开成视频文件，按时段智能排序。
+        """把拖入/选中的路径展开成 (拖入的根, 视频文件)，按时段智能排序。
         文件夹会递归到所有子文件夹（周老师课程常按机位/天分子目录），
-        排除 macOS 的 ._ 资源叉文件。"""
-        videos = []
+        排除 macOS 的 ._ 资源叉文件。带上「根」是为了在清单里显示
+        相对路径（同名的「上午/clip01」「晚上/clip01」才分得清），
+        并据此决定默认输出位置。直接拖文件的根为 None。"""
+        found = []
         for p in paths:
             if p.is_dir():
-                videos.extend(
-                    f for f in p.rglob('*')
+                found.extend(
+                    (p, f) for f in p.rglob('*')
                     if f.is_file() and f.suffix.lower() in VIDEO_EXTS
                     and not f.name.startswith('._'))
             elif (p.is_file() and p.suffix.lower() in VIDEO_EXTS
                   and not p.name.startswith('._')):
-                videos.append(p)
-        return sorted(videos, key=smart_sort_key)
+                found.append((None, p))
+        return sorted(found, key=lambda rf: smart_sort_key(rf[1]))
+
+    @staticmethod
+    def _row_label(root, f, dur):
+        """清单行文字。拖文件夹进来的按相对根的路径显示——
+        「第3天/上午/clip01.mp4」「第3天/晚上/clip01.mp4」只显示文件名会一模一样。"""
+        try:
+            name = str(f.relative_to(root)) if root else f.name
+        except Exception:
+            name = f.name
+        return f'  {name}    {dur}'
 
     def add_paths(self, paths):
         """把拖入/选中的视频追加到清单末尾，去重；返回本次实际新增的数量。"""
@@ -702,19 +825,19 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         added = 0
         bid = self._next_batch
-        todo = [f for f in videos if str(f) not in existing]
-        for idx, f in enumerate(todo, 1):
+        todo = [(root, f) for root, f in videos if str(f) not in existing]
+        for idx, (root, f) in enumerate(todo, 1):
             key = str(f)
             if key in existing:
                 continue
             existing.add(key)
-            # 每个文件都要跑一次 ffprobe，一整天课几十个片段会读上好几秒；
-            # 报进度 + 让出事件循环，免得看起来像卡死。
+            # 每个文件跑一次 ffprobe（实测每个几十毫秒），报进度 + 让出事件循环，
+            # 免得几十个片段时看起来像卡死。
             self.status.setText(f'正在读取文件信息... {idx}/{len(todo)}')
             QApplication.processEvents()
             info = get_video_info(f)
             dur = format_duration(info) if info else '?'
-            item = QListWidgetItem(f'  {f.name}    {dur}')
+            item = QListWidgetItem(self._row_label(root, f, dur))
             item.setData(PATH_ROLE, key)
             item.setData(BATCH_ROLE, bid)
             item.setData(PARAMS_ROLE, stream_params(info))
@@ -724,9 +847,21 @@ class MainWindow(QMainWindow):
         self.status.setText('')
         if added:
             self._next_batch += 1
-            self.config['last_folder'] = str(videos[0].parent)
+            self.config['last_folder'] = str(todo[0][1].parent)
             save_config(self.config)
+            self._apply_default_output(todo[0][0], todo[0][1])
         return added
+
+    def _apply_default_output(self, root, first):
+        """定默认输出位置/文件名：拖「第3天」文件夹 → 输出「第3天.mp4」到它的上一级
+        （跟文件夹并排，不混进素材、也不会被下次拖入扫到）；直接拖文件 → 落文件旁边。
+        只在用户还没自己选过/改过时套用，且只认第一批。"""
+        if not self._src_name:
+            self._src_name = root.name if root else first.parent.name
+        if self._out_dir is None and not self._dir_chosen:
+            self._out_dir = root.parent if root else first.parent
+        if root and not self._name_edited and self.out_name.text() == DEFAULT_OUT_NAME:
+            self.out_name.setText(f'{root.name}.mp4')
 
     def undo(self):
         """删掉最近添加的那一批（按批次号，手动调过序也准）。"""
@@ -741,23 +876,53 @@ class MainWindow(QMainWindow):
                 self.list_widget.takeItem(i)
         self._refresh_state()
 
-    def clear_list(self):
+    def clear_list(self, reset_output=True):
+        """清空清单。reset_output=False 用于合并成功后的自动清空——那时要留住
+        输出位置和文件名，好让「第3期第2天 左机位」改两个字接着合右机位。"""
         self.list_widget.clear()
         self._next_batch = 0
+        self._src_name = ''
+        if reset_output:
+            self._out_dir = None
+            self._dir_chosen = False
+            self._name_edited = False
+            self.out_name.setText(DEFAULT_OUT_NAME)
         self._refresh_state()
 
     def _refresh_state(self):
         n = self.list_widget.count()
         self.count_label.setText(
             f'共 {n} 个待合并 · 可上下拖动调序' if n >= 2 else f'共 {n} 个待合并')
-        self.btn_merge.setEnabled(n >= 2 and not self._merging and not self._adding)
+        if self._merging:
+            self.btn_merge.setEnabled(True)      # 合并中它是「取消」，永远可点
+        else:
+            self.btn_merge.setEnabled(n >= 2 and not self._adding)
         self.btn_undo.setEnabled(n > 0)
         self.btn_clear.setEnabled(n > 0)
-        if n:
-            first = Path(self.list_widget.item(0).data(PATH_ROLE))
-            self.folder_label.setText(f'输出到：{first.parent}')
+        self.folder_label.setText(
+            f'共 {n} 个片段，来自「{self._src_name}」' if n and self._src_name
+            else (f'共 {n} 个片段' if n
+                  else '把视频或文件夹拖进来（或点右边添加文件夹）'))
+        self.out_dir_label.setText(_short_path(self._out_dir) if self._out_dir else '—')
+        self.out_dir_label.setToolTip(str(self._out_dir) if self._out_dir else '')
+
+    def _set_merge_mode(self, merging):
+        """合并中把「开始合并」这一个按钮切成「取消合并」——不另加控件占地方。"""
+        self.btn_merge.setText('取消合并' if merging else '开始合并')
+        self.btn_merge.setObjectName('btn_cancel' if merging else 'btn_merge')
+        self.btn_merge.style().unpolish(self.btn_merge)
+        self.btn_merge.style().polish(self.btn_merge)
+        self.btn_out_dir.setEnabled(not merging)
+        self.out_name.setEnabled(not merging)
+        self._refresh_state()
+
+    def _on_merge_clicked(self):
+        if self._merging:
+            self.btn_merge.setEnabled(False)   # 防连点，等 worker 收尾
+            self.status.setText('正在取消…')
+            self.worker.stop()
         else:
-            self.folder_label.setText('把视频或文件夹拖进来（或点右边添加文件夹）')
+            self.start_merge()
 
     @staticmethod
     def _same_file(a, b):
@@ -775,9 +940,14 @@ class MainWindow(QMainWindow):
             return
         files = [Path(self.list_widget.item(i).data(PATH_ROLE))
                  for i in range(n)]
-        out_dir = files[0].parent
+        out_dir = self._out_dir or files[0].parent
+        if not out_dir.is_dir():
+            QMessageBox.critical(
+                self, '输出位置不可用',
+                f'输出文件夹不存在或已断开：\n{out_dir}\n\n请点「更改」重新选一个。')
+            return
 
-        out_name = self.out_name.text().strip() or '合并输出.mp4'
+        out_name = self.out_name.text().strip() or DEFAULT_OUT_NAME
         if not out_name.endswith(('.mp4', '.mov', '.mkv')):
             out_name += '.mp4'
         output = out_dir / out_name
@@ -800,8 +970,9 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        # 编码一致性校验：concat -c copy 要求各片段编码/分辨率一致，
-        # 否则会失败或产出花屏。不一致时列出差异让用户自己决定。
+        # 编码一致性校验：concat -c copy 要求各片段视频+音频参数一致。
+        # 视频不一致会失败或花屏；音频不一致更阴——ffmpeg 照样报成功，
+        # 产出的音轨比视频短，音画不同步，剪到一半才发现。
         params = [self.list_widget.item(i).data(PARAMS_ROLE) for i in range(n)]
         kinds = []
         for p in params:
@@ -809,11 +980,15 @@ class MainWindow(QMainWindow):
                 kinds.append(p)
         if len(kinds) > 1:
             listed = '\n'.join(f'· {describe_params(p)}' for p in kinds)
+            audio_only = len({tuple(k[0]) if k[0] else None for k in kinds}) == 1
+            head = ('这些片段的音频参数不一致（视频部分是一致的），'
+                    '无损合并会产出音画不同步的成片：'
+                    if audio_only else
+                    '这些片段的编码 / 分辨率 / 像素格式 / 音频参数不完全一致，'
+                    '无损合并（-c copy）可能失败、花屏或音画不同步：')
             reply = QMessageBox.warning(
                 self, '编码不一致',
-                '这些片段的编码 / 分辨率 / 像素格式不完全一致，'
-                '无损合并（-c copy）可能失败或产生花屏：\n\n'
-                f'{listed}\n\n'
+                f'{head}\n\n{listed}\n\n'
                 '建议只合并同一次录制切出的片段。仍要合并吗？',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
@@ -826,7 +1001,7 @@ class MainWindow(QMainWindow):
         self._merged_files = files
         self._delete_after = self.delete_check.isChecked()
         self._merging = True
-        self.btn_merge.setEnabled(False)
+        self._set_merge_mode(True)
         self.progress_bar.setVisible(True)
         self.status.setText('正在合并，请稍候...')
 
@@ -868,8 +1043,9 @@ class MainWindow(QMainWindow):
                 failed.append(f.name)
         return ok, failed
 
-    def on_finished(self, success, msg):
+    def on_finished(self, success, msg, warn=''):
         self._merging = False
+        self._set_merge_mode(False)
         self.progress_bar.setVisible(False)
         if success:
             done_note = f'合并完成：{Path(msg).name}'
@@ -890,11 +1066,19 @@ class MainWindow(QMainWindow):
                             + ('\n…' if len(failed) > 10 else ''))
                     else:
                         done_note = f'合并完成，已删除 {ok} 个原文件'
-            # 任务完成，清空清单准备下一批；输出名与删除勾选保持不动
+            # 任务完成，清空清单准备下一批；输出位置/文件名与删除勾选保持不动
             # （如「第3期第2天 左机位」只需手改成「右机位」即可接着合并）。
-            self.clear_list()
-            self.status.setText(done_note)
-            QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
+            self.clear_list(reset_output=False)
+            self.status.setText(done_note if not warn else done_note + '（有警告）')
+            if warn:
+                # ffmpeg 返回成功≠产出没问题。事前校验拦不住的，这里如实报出来。
+                QMessageBox.warning(
+                    self, '合并完成，但 ffmpeg 报了警告',
+                    f'成片已生成：\n{msg}\n\n'
+                    '但 ffmpeg 报了下面的警告，成片可能音画不同步或有坏帧，'
+                    '建议进 PR 前先抽查一下：\n\n' + warn)
+            else:
+                QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
         else:
             self._refresh_state()
             if msg == '已取消':
