@@ -418,30 +418,41 @@ def _fmt_secs(s):
 
 
 def verify_output(path, expect_dur=0.0):
-    """成片落地后再 ffprobe 复核一遍——第三道也是最靠得住的一道防线。
+    """跑完 ffmpeg 后 ffprobe 复核成片——第三道也是最靠得住的一道防线。
+    返回 (硬伤, 警告)：硬伤 = 这次合并算失败，警告 = 交付但要提醒。
 
     扫 stderr 数警告条数是猜谜，会漏（时间基不一致只吐 1 条，落在正常阈值内）。
     直接量成片本身不会漏，两个判据实测互补：
-      · 成片总时长 vs 素材时长之和 —— 抓时间基/帧率不一致（实测 24.0s vs 应有 20.0s）
+      · 成片总时长 vs 素材时长之和 —— 短了=有片段没合进去（硬伤）；
+        长了=时间基/帧率对不齐（警告，实测 24.0s vs 应有 20.0s）
       · 成片内 视频轨时长 vs 音轨时长 —— 抓音频参数不一致（实测音轨 18.4s vs 视频 20.0s，
         这种情况总时长是对的，只看总时长看不出来）
-    干净素材实测两项误差都在 0.05 秒内，所以阈值放到 1 秒 / 1% 完全不会误报。"""
+
+    「短了」单独判成硬伤，因为它跟另外两种性质不同：
+    长了/不同步是**内容都在、但有毛病**，而且多半是用户在事前弹窗里按了「仍要合并」，
+    他知情；短了是**内容根本没合进去**（素材损坏、外接盘中途断开），
+    ffmpeg 对此不报错、退出码仍是 0，用户从没同意过要一条缺胳膊少腿的成片。
+
+    干净素材实测误差恒为 +0.02 秒左右（末尾音频帧），从不会短，所以
+    「短过 1 秒 / 0.5%」判失败不会误伤。"""
     info = get_video_info(path)
     if not info:
-        return ['成片生成了，但 ffprobe 读不出它的信息，建议手动打开确认一下。']
-    out = []
+        return [], ['成片生成了，但 ffprobe 读不出它的信息，建议手动打开确认一下。']
+    bad, warn = [], []
     total = duration_secs(info)
     if expect_dur > 0 and total > 0:
         diff = total - expect_dur
-        if abs(diff) > max(1.0, expect_dur * 0.01):
-            # 长了和短了是两回事：长了多半是时间基对不齐，短了多半是有片段压根没合进去
-            why = ('这通常是各片段的时间基 / 帧率不一致，音画会从第二段开始越错越多。'
-                   if diff > 0 else
-                   '成片比素材短，多半是有片段没被合进去（素材损坏或读到一半断了）——'
-                   'ffmpeg 遇到这种情况不报错，照样返回「成功」。请核对成片是否完整。')
-            out.append(
+        if diff < -max(1.0, expect_dur * 0.005):
+            bad.append(
+                f'成片只有 {_fmt_secs(total)}，素材合计应为 {_fmt_secs(expect_dur)}，'
+                f'少了 {_fmt_secs(-diff)}。\n'
+                '有片段没被合进去——素材损坏，或外接盘中途断开了。\n'
+                'ffmpeg 碰到这种情况不会报错、退出码照样是 0，所以这里替它判为失败。')
+        elif diff > max(1.0, expect_dur * 0.01):
+            warn.append(
                 f'成片时长 {_fmt_secs(total)}，素材合计应为 {_fmt_secs(expect_dur)}，'
-                f'相差 {diff:+.1f} 秒。\n' + why)
+                f'多了 {_fmt_secs(diff)}。\n'
+                '这通常是各片段的时间基 / 帧率不一致，音画会从第二段开始越错越多。')
     v = a = None
     for s in info.get('streams', []):
         try:
@@ -453,10 +464,10 @@ def verify_output(path, expect_dur=0.0):
         elif s.get('codec_type') == 'audio' and a is None:
             a = d
     if v and a and abs(v - a) > 1.0:
-        out.append(
+        warn.append(
             f'成片里视频轨 {_fmt_secs(v)}、音轨 {_fmt_secs(a)}，相差 {abs(v - a):.1f} 秒，'
             '音画不同步。')
-    return out
+    return bad, warn
 
 
 # ffmpeg 靠输出文件的扩展名猜容器格式。成片先写成临时名再改名，临时名的后缀
@@ -550,6 +561,19 @@ class MergeWorker(QThread):
                 errf.close()
 
             if self._proc.returncode == 0:
+                # 复核放在改名之前，验的是临时文件：查出硬伤就根本不改名，
+                # 目标位置（可能是上一条成片）连碰都没碰过。
+                bad, warns = verify_output(self.tmp, self.total_dur)
+                if bad:
+                    # 缺内容 = 这次合并没成，别当成功交付，也别让它走到「删原文件」那一步。
+                    # 半成品不删：万一判断有偏差，东西还在，路径一并告诉用户。
+                    self._ok = True      # 借这个标记挡住 finally 里的清理，别删它
+                    self.finished.emit(
+                        False, '\n\n'.join(bad) +
+                        f'\n\n目标位置没有被改动。这次的半成品留在：\n{self.tmp}\n'
+                        '（隐藏文件，不会被下次拖入当素材；重合一次就会自动覆盖掉）',
+                        'incomplete')
+                    return
                 self._ok = True          # 从这里起，那份成片不许再被任何异常清掉
                 try:
                     os.replace(self.tmp, self.output)   # 同目录，原子且瞬间完成
@@ -559,9 +583,9 @@ class MergeWorker(QThread):
                                f'成片还在这里，可自己改名取走：\n{self.tmp}', '')
                     return
                 self.progress.emit(100)
-                warns = scan_warnings(err, len(self.files) - 1)
-                warns += verify_output(self.output, self.total_dur)
-                self.finished.emit(True, str(self.output), '\n\n'.join(warns))
+                self.finished.emit(True, str(self.output),
+                                   '\n\n'.join(scan_warnings(err, len(self.files) - 1)
+                                               + warns))
             else:
                 # 失败/取消时 ffmpeg 留下的是临时文件，清掉它，目标位置从没被碰过
                 self._discard_partial()
@@ -1259,12 +1283,20 @@ class MainWindow(QMainWindow):
             if not warn:
                 QMessageBox.information(self, '完成', f'合并成功！\n{msg}')
         else:
+            # 失败不清清单、也绝不会走到删原文件那一步：修好素材可以直接重合
             self._refresh_state()
             if msg == '已取消':
                 self.status.setText('已取消')
                 return
-            self.status.setText('合并失败')
-            QMessageBox.critical(self, '错误', f'合并失败：\n{msg}')
+            if warn == 'incomplete':
+                self.status.setText('合并失败：成片缺内容')
+                QMessageBox.critical(
+                    self, '合并没成功：成片缺内容',
+                    msg + '\n\n清单原样留着，处理好素材（确认硬盘没断开、'
+                          '有没有坏片）就能直接重合。')
+            else:
+                self.status.setText('合并失败')
+                QMessageBox.critical(self, '错误', f'合并失败：\n{msg}')
 
 
 def main():
