@@ -15,9 +15,9 @@ from PyQt6.QtWidgets import (
     QDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QPalette, QColor, QAction
+from PyQt6.QtGui import QAction
 
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
@@ -231,8 +231,9 @@ def get_video_info(path):
     ]
     # ffprobe 缺失、文件损坏、输出不是 JSON 都只当「读不出信息」，
     # 一律返回 None 让上层显示「?」，不能让拖入动作整个崩掉。
+    # 加超时：外接盘半掉线时 ffprobe 会一直挂着，整个拖入动作跟着卡死。
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode != 0:
             return None
         return json.loads(result.stdout)
@@ -360,14 +361,21 @@ def _cn_to_int(s):
 
 
 def _num_before(name, unit):
-    """取「第X<unit>」「X<unit>」里的数字（阿拉伯或中文），无则 None。"""
-    m = re.search(r'第?\s*([0-9零一二三四五六七八九十两]+)\s*' + unit, name)
-    return _cn_to_int(m.group(1)) if m else None
+    """取「第X<unit>」「X<unit>」里的数字（阿拉伯或中文），无则 None。
+    有多处匹配时取**最后**一处：越靠近文件名越具体。上级文件夹叫
+    「三天两夜课程」时，头一处匹配是那个「三天」，会把底下「第一天/第二天」
+    全判成第 3 天，天序整个失效。"""
+    ms = re.findall(r'第?\s*([0-9零一二三四五六七八九十两]+)\s*' + unit, name)
+    return _cn_to_int(ms[-1]) if ms else None
 
 
-def _period_rank(name):
-    ranks = [r for kw, r in _PERIODS if kw in name]
-    return min(ranks) if ranks else 50   # 没有时段词的排在有时段词的之后
+def _period_rank(parts):
+    """按路径从深到浅找时段词，最深一级说了算（文件名 > 子文件夹 > 上级）。"""
+    for seg in reversed(parts):
+        ranks = [r for kw, r in _PERIODS if kw in seg]
+        if ranks:
+            return min(ranks)
+    return 50   # 没有时段词的排在有时段词的之后
 
 
 def smart_sort_key(path):
@@ -379,7 +387,7 @@ def smart_sort_key(path):
     day = _num_before(s, '天')
     return (qi if qi is not None else 0,
             day if day is not None else 0,
-            _period_rank(s),
+            _period_rank(Path(path).parts),
             s)
 
 
@@ -481,11 +489,15 @@ class MergeWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(bool, str, str)   # 成功?, 输出路径/错误, 警告文本
 
-    def __init__(self, files, output, total_dur=0.0):
+    def __init__(self, files, output, total_dur=0.0, expect_dur=0.0):
         super().__init__()
         self.files = files
         self.output = Path(output)
-        self.total_dur = total_dur
+        self.total_dur = total_dur      # 供进度条；有片段读不出时长也照用（只是不准）
+        # 供成片复核。有片段读不出时长时它必须是 0：拿「少算了一段」的和去比，
+        # 成片必然「多出一截」，会误报成时间基不一致，而且恰好是用户刚被告知
+        # 「合并后会再复核一遍」的那种情况，误报最伤信任。
+        self.expect_dur = expect_dur
         self._proc = None
         self._cancelled = False
         self._ok = False          # ffmpeg 真的跑成了？没成才允许清残片
@@ -533,6 +545,10 @@ class MergeWorker(QThread):
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=errf, text=True)
+            if self._cancelled:
+                # stop() 赶在 Popen 之前到了（点取消/关窗极快时会撞上）：那时
+                # _proc 还是 None、没东西可 terminate，ffmpeg 会照常跑完整场。
+                self._proc.terminate()
 
             last = 0
             for line in self._proc.stdout:
@@ -563,7 +579,7 @@ class MergeWorker(QThread):
             if self._proc.returncode == 0:
                 # 复核放在改名之前，验的是临时文件：查出硬伤就根本不改名，
                 # 目标位置（可能是上一条成片）连碰都没碰过。
-                bad, warns = verify_output(self.tmp, self.total_dur)
+                bad, warns = verify_output(self.tmp, self.expect_dur)
                 if bad:
                     # 缺内容 = 这次合并没成，别当成功交付，也别让它走到「删原文件」那一步。
                     # 半成品不删：万一判断有偏差，东西还在，路径一并告诉用户。
@@ -665,6 +681,7 @@ class MainWindow(QMainWindow):
         self._dir_chosen = False  # 用户自己选过输出目录 → 后续拖入不再改动它
         self._name_edited = False # 用户手打过输出名 → 不再套默认名
         self._name_auto = ''      # 上次自动套上的名字；只有它才允许被下一批顶掉
+        self._closing = False     # 关窗了：读取信息的循环要立刻停，别拖着进程不退
         self.setAcceptDrops(True)
         self._build_ui()
         self._build_appmenu()
@@ -970,6 +987,8 @@ class MainWindow(QMainWindow):
         bid = self._next_batch
         todo = [(root, f) for root, f in videos if str(f) not in existing]
         for idx, (root, f) in enumerate(todo, 1):
+            if self._closing:
+                break      # 窗口已关，剩下的不读了，让 app 立刻退出
             key = str(f)
             if key in existing:
                 continue
@@ -1026,6 +1045,8 @@ class MainWindow(QMainWindow):
         for i in range(n - 1, -1, -1):
             if self.list_widget.item(i).data(BATCH_ROLE) == last:
                 self.list_widget.takeItem(i)
+        if self.list_widget.count() == 0:
+            self._src_name = ''    # 撤到空了，别让下一批还顶着上一批的来源名
         self._refresh_state()
 
     def clear_list(self, reset_output=True):
@@ -1053,7 +1074,9 @@ class MainWindow(QMainWindow):
         # 合并中锁住清单：改了也影响不到这次合并，合完还会被自动清空
         self.btn_undo.setEnabled(n > 0 and not self._merging)
         self.btn_clear.setEnabled(n > 0 and not self._merging)
-        self.btn_folder.setEnabled(not self._merging)
+        # 读取中也锁：读取时 processEvents 会放行点击，这时点开文件夹对话框
+        # 会被 add_paths 的重入保护挡回去，白选一趟还提示「没有可添加的视频」
+        self.btn_folder.setEnabled(not self._merging and not self._adding)
         self.folder_label.setText(
             f'共 {n} 个片段，来自「{self._src_name}」' if n and self._src_name
             else (f'共 {n} 个片段' if n
@@ -1119,6 +1142,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self, '输出位置不可用',
                 f'输出文件夹不存在或已断开：\n{out_dir}\n\n请点「更改」重新选一个。')
+            return
+        # 拖的是外接盘根目录时，默认输出位置会落到 /Volumes 这种写不进的地方，
+        # 不拦的话要等 ffmpeg 跑起来才报一句 Permission denied。
+        if not os.access(out_dir, os.W_OK):
+            QMessageBox.critical(
+                self, '输出位置不可写',
+                f'没有权限往这个文件夹写文件：\n{out_dir}\n\n请点「更改」换一个。')
             return
 
         out_name = self.out_name.text().strip() or DEFAULT_OUT_NAME
@@ -1189,8 +1219,15 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        total_dur = sum(self.list_widget.item(i).data(SECS_ROLE) or 0
-                        for i in range(n))
+        secs = [self.list_widget.item(i).data(SECS_ROLE) or 0 for i in range(n)]
+        total_dur = sum(secs)
+        # 有片段读不出时长 → 复核时不比总时长（见 MergeWorker.expect_dur）
+        expect_dur = total_dur if all(x > 0 for x in secs) else 0.0
+        # 上一个 worker 线程可能还在收尾（信号是先发出、后清临时文件），
+        # 这时换掉引用让它被回收 = QThread 运行中被销毁，直接崩
+        old = getattr(self, 'worker', None)
+        if old is not None:
+            old.wait()
         self._merged_files = files
         self._delete_after = self.delete_check.isChecked()
         self._merging = True
@@ -1198,7 +1235,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.status.setText('正在合并，请稍候...')
 
-        self.worker = MergeWorker(files, output, total_dur)
+        self.worker = MergeWorker(files, output, total_dur, expect_dur)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
@@ -1213,6 +1250,7 @@ class MainWindow(QMainWindow):
             self.status.setText(f'正在合并… {pct}%')
 
     def closeEvent(self, event):
+        self._closing = True
         if hasattr(self, 'worker') and self.worker.isRunning():
             # 先断信号：窗口马上就销毁了，晚到的 finished 打进来会崩。
             try:
