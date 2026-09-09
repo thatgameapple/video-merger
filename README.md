@@ -93,4 +93,4 @@ brew install python@3.11
 
 ---
 
-**v1.5.2** · thatgameapple
+**v1.5.3** · thatgameapple

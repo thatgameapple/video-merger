@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction
 
-VERSION = '1.5.2'
+VERSION = '1.5.3'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
@@ -317,6 +317,21 @@ def diff_kind(kinds):
     if len({v[:4] if v else None for v in videos}) == 1:
         return 'timebase'
     return 'video'
+
+
+def list_mismatch(kinds, params, names, per_kind=6):
+    """把「参数不一致」弹窗的正文列出来：每种参数下面跟着属于它的文件，
+    片段少的那种排前面——混进来的多半就是那一两个，用户一眼看出该撤哪几个。
+    只列参数不列文件的话，他还得回清单里挨个猜。"""
+    groups = [(k, [n for pp, n in zip(params, names) if pp == k]) for k in kinds]
+    groups.sort(key=lambda g: len(g[1]))
+    out = []
+    for k, ns in groups:
+        out.append(f'· {describe_params(k)}   ({len(ns)} 个)')
+        out.extend(f'      {n}' for n in ns[:per_kind])
+        if len(ns) > per_kind:
+            out.append(f'      … 还有 {len(ns) - per_kind} 个')
+    return '\n'.join(out)
 
 
 def _short_path(p):
@@ -1188,7 +1203,9 @@ class MainWindow(QMainWindow):
         tail = (f'\n\n另有 {unknown} 个片段读不出编码信息（清单里时长显示「?」），'
                 '这几个没法校验。' if unknown else '')
         if len(kinds) > 1:
-            listed = '\n'.join(f'· {describe_params(p)}' for p in kinds)
+            names = [self.list_widget.item(i).text().strip().rsplit('    ', 1)[0]
+                     for i in range(n)]
+            listed = list_mismatch(kinds, params, names)
             head = {
                 'audio': '这些片段的音频参数不一致（画面参数是一致的），'
                          '无损合并会产出音画不同步的成片：',
