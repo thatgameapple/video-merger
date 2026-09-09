@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction
 
-VERSION = '1.5.3'
+VERSION = '1.6.0'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
@@ -334,6 +334,32 @@ def list_mismatch(kinds, params, names, per_kind=6):
     return '\n'.join(out)
 
 
+def plan_timebase_fix(params, files):
+    """只有时间基对不上时，能不能无损修？能就返回 (目标 timescale, 要重封装的下标)。
+
+    实测（ffmpeg 8.1）：把少数派片段用 `-c copy -video_track_timescale N` 重封装成
+    和大多数一样的时基，视频数据逐字节不变（md5 相同），再 concat 就是对的：
+    30fps 两段 + 24fps 一段，直接拼视频轨 4.8s/音轨 6.0s；统一时基后 5.98s/6.02s。
+    25fps 混 30fps（15360/25 不整除）同样正确，时间戳只有亚毫秒级舍入。
+
+    目标取多数派的时基（重封装最少）；平手取排最前的。
+    只在所有片段的时基都是 1/N、容器都是 mp4/mov 系（-video_track_timescale 是
+    mov 系 muxer 的选项，mkv 没有）时才给方案，否则返回 None 不逞强。"""
+    tbs = []
+    for p, f in zip(params, files):
+        if not p or not p[0] or Path(f).suffix.lower() not in ('.mp4', '.m4v', '.mov'):
+            return None
+        m = re.fullmatch(r'1/(\d+)', str(p[0][4] or ''))
+        if not m:
+            return None
+        tbs.append(m.group(1))
+    if len(set(tbs)) < 2:
+        return None
+    target = max(dict.fromkeys(tbs), key=tbs.count)   # 多数派；平手取最先出现的
+    idxs = [i for i, tb in enumerate(tbs) if tb != target]
+    return int(target), idxs
+
+
 def _short_path(p):
     """外接盘路径太长，界面上只显示末两级，全路径挂 tooltip。"""
     parts = Path(p).parts
@@ -502,12 +528,15 @@ MUX_FORMAT = {'.mp4': 'mp4', '.m4v': 'mp4', '.mov': 'mov', '.mkv': 'matroska'}
 class MergeWorker(QThread):
     # 百分比 0-100；-1 表示无法估算总时长，走不确定进度（转圈）
     progress = pyqtSignal(int)
+    status = pyqtSignal(str)                 # 阶段文字（统一时基 1/2：xxx）
     finished = pyqtSignal(bool, str, str)   # 成功?, 输出路径/错误, 警告文本
 
-    def __init__(self, files, output, total_dur=0.0, expect_dur=0.0):
+    def __init__(self, files, output, total_dur=0.0, expect_dur=0.0, fix_tb=None):
         super().__init__()
         self.files = files
         self.output = Path(output)
+        # (目标 timescale, 要先无损重封装的片段下标)，见 plan_timebase_fix；None = 不修
+        self.fix_tb = fix_tb
         self.total_dur = total_dur      # 供进度条；有片段读不出时长也照用（只是不准）
         # 供成片复核。有片段读不出时长时它必须是 0：拿「少算了一段」的和去比，
         # 成片必然「多出一截」，会误报成时间基不一致，而且恰好是用户刚被告知
@@ -531,32 +560,15 @@ class MergeWorker(QThread):
             t.daemon = True
             t.start()
 
-    def run(self):
-        list_file = err_file = None
+    def _run_ffmpeg(self, cmd, with_progress):
+        """跑一个 ffmpeg，返回 (returncode, stderr 全文)。
+        -progress pipe:1 让 ffmpeg 周期性吐出 out_time；stderr 另存文件，
+        失败时读回尾部报错（避免 PIPE 塞满死锁）。
+        errors='replace'：素材带非 UTF-8 元数据（摄像机的 GBK 中文 tag 等）时，
+        ffmpeg 会把原始字节刷进 stderr，严格解码会在这里抛 UnicodeDecodeError。"""
+        errf = tempfile.NamedTemporaryFile(mode='w+', suffix='.log', delete=False,
+                                           encoding='utf-8', errors='replace')
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
-                                             delete=False, encoding='utf-8') as f:
-                for fp in self.files:
-                    escaped = str(fp).replace("'", "'\\''")
-                    f.write(f"file '{escaped}'\n")
-                list_file = f.name
-
-            self.progress.emit(0 if self.total_dur > 0 else -1)
-            # -progress pipe:1 让 ffmpeg 周期性吐出 out_time；stderr 另存文件，
-            # 失败时读回尾部报错（避免 PIPE 塞满死锁）。
-            # -nostdin：ffmpeg 默认会去抢父进程的 stdin，标准做法是关掉。
-            mux = MUX_FORMAT.get(self.output.suffix.lower(), 'mp4')
-            cmd = [
-                FFMPEG, '-nostdin', '-y', '-f', 'concat', '-safe', '0',
-                '-i', list_file, '-c', 'copy', '-progress', 'pipe:1',
-                '-nostats', '-f', mux, str(self.tmp)
-            ]
-            # errors='replace'：素材带非 UTF-8 元数据（摄像机的 GBK 中文 tag 等）时，
-            # ffmpeg 会把原始字节刷进 stderr，严格解码会在这里抛 UnicodeDecodeError。
-            errf = tempfile.NamedTemporaryFile(mode='w+', suffix='.log',
-                                               delete=False, encoding='utf-8',
-                                               errors='replace')
-            err_file = errf.name
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=errf, text=True)
@@ -564,9 +576,10 @@ class MergeWorker(QThread):
                 # stop() 赶在 Popen 之前到了（点取消/关窗极快时会撞上）：那时
                 # _proc 还是 None、没东西可 terminate，ffmpeg 会照常跑完整场。
                 self._proc.terminate()
-
             last = 0
             for line in self._proc.stdout:
+                if not with_progress:
+                    continue
                 line = line.strip()
                 sec = None
                 if line.startswith(('out_time_us=', 'out_time_ms=')):
@@ -582,16 +595,73 @@ class MergeWorker(QThread):
                         self.progress.emit(pct)
             self._proc.stdout.close()
             self._proc.wait()
-
             try:
                 errf.seek(0)
                 err = errf.read()
             except Exception:
                 err = ''     # 读不出 stderr 只是少了警告线索，绝不能因此把成片判成失败
-            finally:
-                errf.close()
+            return self._proc.returncode, err
+        finally:
+            errf.close()
+            try:
+                os.unlink(errf.name)
+            except Exception:
+                pass
 
-            if self._proc.returncode == 0:
+    def run(self):
+        list_file = None
+        fixed = []      # 统一时基时重封装出的临时文件，不管成败最后都清
+        files = list(self.files)
+        try:
+            # ── 阶段一（可选）：把少数派片段无损重封装成多数派的时基 ──
+            # 临时文件放输出目录（跟成片同盘，几个 GB 的课程录像放系统盘 tmp 会塞满），
+            # 「.」开头 + 视频后缀前插 vmfix：隐藏，且下次拖入文件夹不会被扫到。
+            if self.fix_tb:
+                scale, idxs = self.fix_tb
+                for k, i in enumerate(idxs, 1):
+                    src = files[i]
+                    dst = self.output.with_name(
+                        f'.{self.output.stem}.vmfix{i}{src.suffix.lower()}')
+                    fixed.append(dst)
+                    self.status.emit(f'正在统一时基 {k}/{len(idxs)}：{src.name}')
+                    self.progress.emit(-1)
+                    # 只带视频+音频：concat 关心的就这两种；摄像机的 tmcd 之类数据轨
+                    # 换容器时会让 muxer 报错，不值得为它冒险。
+                    rc, err = self._run_ffmpeg([
+                        FFMPEG, '-nostdin', '-y', '-i', str(src),
+                        '-map', '0:v', '-map', '0:a?', '-c', 'copy',
+                        '-video_track_timescale', str(scale),
+                        '-f', MUX_FORMAT.get(src.suffix.lower(), 'mp4'), str(dst)
+                    ], with_progress=False)
+                    if rc != 0:
+                        if self._cancelled:
+                            self.finished.emit(False, '已取消', '')
+                        else:
+                            self.finished.emit(
+                                False, f'统一时基失败（{src.name}）：\n'
+                                       + (err[-500:] or '未知错误'), '')
+                        return
+                    files[i] = dst
+                self.status.emit('正在合并，请稍候...')
+
+            # ── 阶段二：concat ──
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
+                                             delete=False, encoding='utf-8') as f:
+                for fp in files:
+                    escaped = str(fp).replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+                list_file = f.name
+
+            self.progress.emit(0 if self.total_dur > 0 else -1)
+            # -nostdin：ffmpeg 默认会去抢父进程的 stdin，标准做法是关掉。
+            mux = MUX_FORMAT.get(self.output.suffix.lower(), 'mp4')
+            rc, err = self._run_ffmpeg([
+                FFMPEG, '-nostdin', '-y', '-f', 'concat', '-safe', '0',
+                '-i', list_file, '-c', 'copy', '-progress', 'pipe:1',
+                '-nostats', '-f', mux, str(self.tmp)
+            ], with_progress=True)
+
+            if rc == 0:
                 # 复核放在改名之前，验的是临时文件：查出硬伤就根本不改名，
                 # 目标位置（可能是上一条成片）连碰都没碰过。
                 bad, warns = verify_output(self.tmp, self.expect_dur)
@@ -615,7 +685,7 @@ class MergeWorker(QThread):
                     return
                 self.progress.emit(100)
                 self.finished.emit(True, str(self.output),
-                                   '\n\n'.join(scan_warnings(err, len(self.files) - 1)
+                                   '\n\n'.join(scan_warnings(err, len(files) - 1)
                                                + warns))
             else:
                 # 失败/取消时 ffmpeg 留下的是临时文件，清掉它，目标位置从没被碰过
@@ -628,7 +698,7 @@ class MergeWorker(QThread):
             self._discard_partial()
             self.finished.emit(False, str(e), '')
         finally:
-            for p in (list_file, err_file):
+            for p in [list_file] + fixed:
                 if p:
                     try:
                         os.unlink(p)
@@ -1202,9 +1272,10 @@ class MainWindow(QMainWindow):
         # 读不出参数的片段（清单里时长显示「?」）校验不了，得说清楚，不能装作查过
         tail = (f'\n\n另有 {unknown} 个片段读不出编码信息（清单里时长显示「?」），'
                 '这几个没法校验。' if unknown else '')
+        names = [self.list_widget.item(i).text().strip().rsplit('    ', 1)[0]
+                 for i in range(n)]
+        fix_tb = None
         if len(kinds) > 1:
-            names = [self.list_widget.item(i).text().strip().rsplit('    ', 1)[0]
-                     for i in range(n)]
             listed = list_mismatch(kinds, params, names)
             head = {
                 'audio': '这些片段的音频参数不一致（画面参数是一致的），'
@@ -1215,15 +1286,41 @@ class MainWindow(QMainWindow):
                 'video': '这些片段的编码 / 分辨率 / 像素格式 / 音频参数不完全一致，'
                          '无损合并（-c copy）可能失败、花屏或音画不同步：',
             }[diff_kind(kinds)]
-            reply = QMessageBox.warning(
-                self, '参数不一致',
-                f'{head}\n\n{listed}{tail}\n\n'
-                '建议只合并同一次录制切出的片段。仍要合并吗？',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+            fix = (plan_timebase_fix(params, files)
+                   if diff_kind(kinds) == 'timebase' and not unknown else None)
+            if fix:
+                # 只有时基不同 → 能无损修：先把少数派重封装成多数派的时基再拼。
+                # 这里把「修」放成默认键，「直接合并」是明知会出坏片的那条路。
+                n_fix = len(fix[1])
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle('参数不一致')
+                box.setText(
+                    f'{head}\n\n{listed}\n\n'
+                    f'可以先把少数的那 {n_fix} 个片段无损重封装成一样的时基再合并：'
+                    '不重编码、画面数据逐字节不变，只多花一次读写的时间。'
+                    '临时文件放在输出文件夹里（隐藏），合完自动删。')
+                b_fix = box.addButton('统一时基后合并', QMessageBox.ButtonRole.AcceptRole)
+                b_raw = box.addButton('仍要直接合并', QMessageBox.ButtonRole.DestructiveRole)
+                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.setDefaultButton(b_fix)
+                box.exec()
+                if box.clickedButton() is b_fix:
+                    fix_tb = fix
+                elif box.clickedButton() is b_raw:
+                    fix_tb = None
+                else:
+                    return
+            else:
+                reply = QMessageBox.warning(
+                    self, '参数不一致',
+                    f'{head}\n\n{listed}{tail}\n\n'
+                    '建议只合并同一次录制切出的片段。仍要合并吗？',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
         elif unknown:
             reply = QMessageBox.warning(
                 self, '有片段读不出信息',
@@ -1252,8 +1349,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.status.setText('正在合并，请稍候...')
 
-        self.worker = MergeWorker(files, output, total_dur, expect_dur)
+        self.worker = MergeWorker(files, output, total_dur, expect_dur, fix_tb)
         self.worker.progress.connect(self.on_progress)
+        self.worker.status.connect(self.status.setText)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
@@ -1272,6 +1370,7 @@ class MainWindow(QMainWindow):
             # 先断信号：窗口马上就销毁了，晚到的 finished 打进来会崩。
             try:
                 self.worker.progress.disconnect()
+                self.worker.status.disconnect()
                 self.worker.finished.disconnect()
             except TypeError:
                 pass
