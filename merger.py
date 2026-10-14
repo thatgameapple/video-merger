@@ -6,18 +6,20 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
     QProgressBar, QLineEdit, QMessageBox, QAbstractItemView, QCheckBox,
-    QDialog
+    QDialog, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction
 
-VERSION = '1.6.0'
+VERSION = '1.6.1'
 AUTHOR = 'thatgameapple'
 APP_NAME = 'Video Merge'
 VIDEO_EXTS = {'.mp4', '.mov', '.mkv', '.avi', '.m4v', '.mts', '.m2ts'}
@@ -29,7 +31,17 @@ PARAMS_ROLE = int(Qt.ItemDataRole.UserRole) + 2  # 视频+音频关键参数，�
 SECS_ROLE = int(Qt.ItemDataRole.UserRole) + 3   # 时长（秒），求和得总时长供真实进度
 
 
+IS_WIN = sys.platform == 'win32'
+IS_MAC = sys.platform == 'darwin'
+# Windows 打包成无控制台的窗口程序后，每起一个 ffmpeg/ffprobe 都会闪一个黑框，
+# 拖 30 个片段就闪 30 下。CREATE_NO_WINDOW 让子进程不开控制台。
+NO_WINDOW = {'creationflags': subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+UI_FONT = 'Microsoft YaHei UI' if IS_WIN else 'PingFang SC'
+
+
 def _resolve_binary(name: str) -> str:
+    if IS_WIN:
+        name += '.exe'
     candidates = []
     if getattr(sys, 'frozen', False):
         meipass = getattr(sys, '_MEIPASS', None)
@@ -78,7 +90,7 @@ STYLESHEET = f"""
 QMainWindow, QWidget {{
     background-color: {C['bg']};
     color: {C['fg']};
-    font-family: "PingFang SC";
+    font-family: "{UI_FONT}";
     font-size: 13px;
 }}
 QLabel {{
@@ -233,7 +245,8 @@ def get_video_info(path):
     # 一律返回 None 让上层显示「?」，不能让拖入动作整个崩掉。
     # 加超时：外接盘半掉线时 ffprobe 会一直挂着，整个拖入动作跟着卡死。
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                encoding='utf-8', errors='replace', **NO_WINDOW)
         if result.returncode != 0:
             return None
         return json.loads(result.stdout)
@@ -363,7 +376,7 @@ def plan_timebase_fix(params, files):
 def _short_path(p):
     """外接盘路径太长，界面上只显示末两级，全路径挂 tooltip。"""
     parts = Path(p).parts
-    return '…/' + '/'.join(parts[-2:]) if len(parts) > 3 else str(p)
+    return '…' + os.sep + os.path.join(*parts[-2:]) if len(parts) > 3 else str(p)
 
 
 def _parse_hms(s):
@@ -429,7 +442,13 @@ def smart_sort_key(path):
     return (qi if qi is not None else 0,
             day if day is not None else 0,
             _period_rank(Path(path).parts),
-            s)
+            _natural(s))
+
+
+def _natural(s):
+    """同一时段内按文件名排时，数字按数值比：「上午2」排在「上午10」前面。"""
+    return [(0, int(t), '') if t.isdigit() else (1, 0, t)
+            for t in re.split(r'(\d+)', s) if t]
 
 
 # ffmpeg 返回 0 也未必干净。事前的参数校验拦不住未知情况，这是第二道防线。
@@ -531,9 +550,11 @@ class MergeWorker(QThread):
     status = pyqtSignal(str)                 # 阶段文字（统一时基 1/2：xxx）
     finished = pyqtSignal(bool, str, str)   # 成功?, 输出路径/错误, 警告文本
 
-    def __init__(self, files, output, total_dur=0.0, expect_dur=0.0, fix_tb=None):
+    def __init__(self, files, output, total_dur=0.0, expect_dur=0.0, fix_tb=None,
+                 secs=None):
         super().__init__()
         self.files = files
+        self.secs = secs or []          # 各片段时长，统一时基阶段报进度用
         self.output = Path(output)
         # (目标 timescale, 要先无损重封装的片段下标)，见 plan_timebase_fix；None = 不修
         self.fix_tb = fix_tb
@@ -560,9 +581,9 @@ class MergeWorker(QThread):
             t.daemon = True
             t.start()
 
-    def _run_ffmpeg(self, cmd, with_progress):
+    def _run_ffmpeg(self, cmd, dur=0.0):
         """跑一个 ffmpeg，返回 (returncode, stderr 全文)。
-        -progress pipe:1 让 ffmpeg 周期性吐出 out_time；stderr 另存文件，
+        dur > 0 时按 -progress pipe:1 吐出的 out_time 报百分比；stderr 另存文件，
         失败时读回尾部报错（避免 PIPE 塞满死锁）。
         errors='replace'：素材带非 UTF-8 元数据（摄像机的 GBK 中文 tag 等）时，
         ffmpeg 会把原始字节刷进 stderr，严格解码会在这里抛 UnicodeDecodeError。"""
@@ -571,14 +592,14 @@ class MergeWorker(QThread):
         try:
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=errf, text=True)
+                stdout=subprocess.PIPE, stderr=errf, text=True, **NO_WINDOW)
             if self._cancelled:
                 # stop() 赶在 Popen 之前到了（点取消/关窗极快时会撞上）：那时
                 # _proc 还是 None、没东西可 terminate，ffmpeg 会照常跑完整场。
                 self._proc.terminate()
             last = 0
             for line in self._proc.stdout:
-                if not with_progress:
+                if dur <= 0:
                     continue
                 line = line.strip()
                 sec = None
@@ -588,8 +609,8 @@ class MergeWorker(QThread):
                         sec = int(v) / 1_000_000
                 elif line.startswith('out_time='):
                     sec = _parse_hms(line.split('=', 1)[1])
-                if sec is not None and self.total_dur > 0:
-                    pct = max(0, min(99, int(sec / self.total_dur * 100)))
+                if sec is not None:
+                    pct = max(0, min(99, int(sec / dur * 100)))
                     if pct != last:
                         last = pct
                         self.progress.emit(pct)
@@ -624,15 +645,17 @@ class MergeWorker(QThread):
                         f'.{self.output.stem}.vmfix{i}{src.suffix.lower()}')
                     fixed.append(dst)
                     self.status.emit(f'正在统一时基 {k}/{len(idxs)}：{src.name}')
-                    self.progress.emit(-1)
+                    d = self.secs[i] if i < len(self.secs) else 0.0
+                    self.progress.emit(0 if d > 0 else -1)
                     # 只带视频+音频：concat 关心的就这两种；摄像机的 tmcd 之类数据轨
                     # 换容器时会让 muxer 报错，不值得为它冒险。
                     rc, err = self._run_ffmpeg([
                         FFMPEG, '-nostdin', '-y', '-i', str(src),
                         '-map', '0:v', '-map', '0:a?', '-c', 'copy',
                         '-video_track_timescale', str(scale),
+                        '-progress', 'pipe:1', '-nostats',
                         '-f', MUX_FORMAT.get(src.suffix.lower(), 'mp4'), str(dst)
-                    ], with_progress=False)
+                    ], dur=d)
                     if rc != 0:
                         if self._cancelled:
                             self.finished.emit(False, '已取消', '')
@@ -642,13 +665,14 @@ class MergeWorker(QThread):
                                        + (err[-500:] or '未知错误'), '')
                         return
                     files[i] = dst
-                self.status.emit('正在合并，请稍候...')
 
             # ── 阶段二：concat ──
+            self.status.emit('正在合并')
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt',
                                              delete=False, encoding='utf-8') as f:
                 for fp in files:
-                    escaped = str(fp).replace("'", "'\\''")
+                    # 统一用正斜杠：Windows 的 ffmpeg 认 C:/a/b.mp4，反斜杠在清单语法里是转义符
+                    escaped = Path(fp).as_posix().replace("'", "'\\''")
                     f.write(f"file '{escaped}'\n")
                 list_file = f.name
 
@@ -659,11 +683,13 @@ class MergeWorker(QThread):
                 FFMPEG, '-nostdin', '-y', '-f', 'concat', '-safe', '0',
                 '-i', list_file, '-c', 'copy', '-progress', 'pipe:1',
                 '-nostats', '-f', mux, str(self.tmp)
-            ], with_progress=True)
+            ], dur=self.total_dur)
 
             if rc == 0:
                 # 复核放在改名之前，验的是临时文件：查出硬伤就根本不改名，
                 # 目标位置（可能是上一条成片）连碰都没碰过。
+                self.status.emit('正在复核成片')
+                self.progress.emit(-1)
                 bad, warns = verify_output(self.tmp, self.expect_dur)
                 if bad:
                     # 缺内容 = 这次合并没成，别当成功交付，也别让它走到「删原文件」那一步。
@@ -720,12 +746,29 @@ class MergeWorker(QThread):
 class DropListWidget(QListWidget):
     """行内拖动可调序；外部文件/文件夹拖入则转交回调（add_paths）处理。"""
 
-    def __init__(self, on_external):
+    def __init__(self, on_external, on_remove):
         super().__init__()
         self._on_external = on_external
+        self._on_remove = on_remove
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # 可多选（⇧/⌘ 点选）：一次移除好几个混进来的片段
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._on_remove()
+        else:
+            super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        if not self.selectedItems() or self.dragDropMode() == \
+                QAbstractItemView.DragDropMode.NoDragDrop:   # 合并中锁着
+            return
+        menu = QMenu(self)
+        n = len(self.selectedItems())
+        menu.addAction(f'从清单移除{f"（{n} 个）" if n > 1 else ""}', self._on_remove)
+        menu.exec(event.globalPos())
 
     def _is_external(self, event):
         return event.mimeData().hasUrls() and event.source() is not self
@@ -783,8 +826,9 @@ class MainWindow(QMainWindow):
         about.setMenuRole(QAction.MenuRole.NoRole)
         about.triggered.connect(self._open_about)
         hm.addAction(about)
-        # 删掉 Qt 往应用菜单塞的英文/无用默认项（About Qt、首选项）
-        QTimer.singleShot(0, self._localize_native_appmenu)
+        # 删掉 Qt 往应用菜单塞的英文/无用默认项（About Qt、首选项）；Windows 没有应用菜单
+        if IS_MAC:
+            QTimer.singleShot(0, self._localize_native_appmenu)
 
     def _open_about(self):
         dlg = QDialog(self)
@@ -795,7 +839,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(30, 28, 30, 26)
         lay.setSpacing(5)
 
-        def _lbl(text, size, color, family='PingFang SC'):
+        def _lbl(text, size, color, family=UI_FONT):
             l = QLabel(text)
             l.setAlignment(Qt.AlignmentFlag.AlignCenter)
             l.setStyleSheet(f"color:{color}; font-size:{size}px; font-family:'{family}';")
@@ -907,7 +951,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         # 文件列表
-        self.list_widget = DropListWidget(self.add_paths)
+        self.list_widget = DropListWidget(self.add_paths, self.remove_selected)
         self.list_widget.setAlternatingRowColors(True)
         # 手动拖动调序后，刷新状态（首个文件决定输出目录）
         self.list_widget.model().rowsMoved.connect(lambda *a: self._refresh_state())
@@ -1023,7 +1067,8 @@ class MainWindow(QMainWindow):
     def _gather_videos(self, paths):
         """把拖入/选中的路径展开成 (拖入的根, 视频文件)，按时段智能排序。
         文件夹会递归到所有子文件夹（周老师课程常按机位/天分子目录），
-        排除 macOS 的 ._ 资源叉文件。带上「根」是为了在清单里显示
+        排除所有「.」开头的隐藏文件：macOS 的 ._ 资源叉，以及本工具万一崩溃
+        留下的 .xxx.vmfix0.mp4（后缀是 .mp4，只排 ._ 会被当素材扫进来）。带上「根」是为了在清单里显示
         相对路径（同名的「上午/clip01」「晚上/clip01」才分得清），
         并据此决定默认输出位置。直接拖文件的根为 None。"""
         found = []
@@ -1032,9 +1077,9 @@ class MainWindow(QMainWindow):
                 found.extend(
                     (p, f) for f in p.rglob('*')
                     if f.is_file() and f.suffix.lower() in VIDEO_EXTS
-                    and not f.name.startswith('._'))
+                    and not f.name.startswith('.'))
             elif (p.is_file() and p.suffix.lower() in VIDEO_EXTS
-                  and not p.name.startswith('._')):
+                  and not p.name.startswith('.')):
                 found.append((None, p))
         return sorted(found, key=lambda rf: smart_sort_key(rf[1]))
 
@@ -1070,34 +1115,52 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         added = 0
         bid = self._next_batch
-        todo = [(root, f) for root, f in videos if str(f) not in existing]
-        for idx, (root, f) in enumerate(todo, 1):
-            if self._closing:
-                break      # 窗口已关，剩下的不读了，让 app 立刻退出
-            key = str(f)
-            if key in existing:
-                continue
-            existing.add(key)
-            # 每个文件跑一次 ffprobe（实测每个几十毫秒），报进度 + 让出事件循环，
-            # 免得几十个片段时看起来像卡死。
-            self.status.setText(f'正在读取文件信息... {idx}/{len(todo)}')
-            QApplication.processEvents()
-            info = get_video_info(f)
-            dur = format_duration(info) if info else '?'
-            item = QListWidgetItem(self._row_label(root, f, dur))
-            item.setData(PATH_ROLE, key)
-            item.setData(BATCH_ROLE, bid)
-            item.setData(PARAMS_ROLE, stream_params(info))
-            item.setData(SECS_ROLE, duration_secs(info))
-            self.list_widget.addItem(item)
-            added += 1
+        todo = list({str(f): (root, f) for root, f in videos
+                     if str(f) not in existing}.values())
+        # ffprobe 放进后台线程池，几个一起读：以前是主线程一个一个读，
+        # 外接盘慢的时候每读一个界面就僵一下，半掉线时能僵到 ffprobe 超时（120 秒）。
+        # 结果仍按清单顺序逐个收，排序不受谁先读完影响。
+        pool = ThreadPoolExecutor(max_workers=4)
+        futs = [pool.submit(get_video_info, f) for _, f in todo]
+        try:
+            for idx, ((root, f), fut) in enumerate(zip(todo, futs), 1):
+                self.status.setText(f'正在读取文件信息... {idx}/{len(todo)}')
+                info = self._wait_future(fut)
+                if self._closing:
+                    break      # 窗口已关，剩下的不读了，让 app 立刻退出
+                added += self._append_item(root, f, info, bid)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         self.status.setText('')
         if added:
             self._next_batch += 1
-            self.config['last_folder'] = str(todo[0][1].parent)
+            # 记拖入文件夹的上一级：下次点「添加文件夹」正好落在「第3天」「第4天」并排处
+            r0, f0 = todo[0]
+            self.config['last_folder'] = str(r0.parent if r0 else f0.parent)
             save_config(self.config)
             self._apply_default_output(todo[0][0], todo[0][1], was_empty)
         return added
+
+    def _wait_future(self, fut):
+        """等后台 ffprobe 出结果，等的时候一直让出事件循环，界面不僵。"""
+        while not self._closing:
+            try:
+                return fut.result(timeout=0.03)
+            except FutTimeout:
+                QApplication.processEvents()
+            except Exception:
+                return None
+        return None
+
+    def _append_item(self, root, f, info, bid):
+        dur = format_duration(info) if info else '?'
+        item = QListWidgetItem(self._row_label(root, f, dur))
+        item.setData(PATH_ROLE, str(f))
+        item.setData(BATCH_ROLE, bid)
+        item.setData(PARAMS_ROLE, stream_params(info))
+        item.setData(SECS_ROLE, duration_secs(info))
+        self.list_widget.addItem(item)
+        return 1
 
     def _apply_default_output(self, root, first, was_empty):
         """定默认输出位置/文件名：拖「第3天」文件夹 → 输出「第3天.mp4」到它的上一级
@@ -1134,6 +1197,19 @@ class MainWindow(QMainWindow):
             self._src_name = ''    # 撤到空了，别让下一批还顶着上一批的来源名
         self._refresh_state()
 
+    def remove_selected(self):
+        """移除选中的几行（只是移出清单，不碰文件）。批次「撤销」管不到的情况靠它：
+        一个文件夹里混进一条学员分享 / 别的机位，单独拿掉就行，不用整批撤了重拖。"""
+        if self._merging or self._adding:
+            return
+        rows = sorted((self.list_widget.row(it) for it in self.list_widget.selectedItems()),
+                      reverse=True)
+        for r in rows:
+            self.list_widget.takeItem(r)
+        if self.list_widget.count() == 0:
+            self._src_name = ''
+        self._refresh_state()
+
     def clear_list(self, reset_output=True):
         """清空清单。reset_output=False 用于合并成功后的自动清空——那时要留住
         输出位置和文件名，好让「第3期第2天 左机位」改两个字接着合右机位。"""
@@ -1150,8 +1226,12 @@ class MainWindow(QMainWindow):
 
     def _refresh_state(self):
         n = self.list_widget.count()
-        self.count_label.setText(
-            f'共 {n} 个待合并 · 可上下拖动调序' if n >= 2 else f'共 {n} 个待合并')
+        secs = [self.list_widget.item(i).data(SECS_ROLE) or 0 for i in range(n)]
+        total = (f' · 合计 {_fmt_secs(sum(secs))}' + ('+?' if not all(secs) else '')
+                 if n and any(secs) else '')
+        self.count_label.setText(f'共 {n} 个待合并{total}')
+        self.count_label.setToolTip('可上下拖动调序；选中后按 Delete 或右键可单独移除'
+                                    if n else '')
         if self._merging:
             self.btn_merge.setEnabled(True)      # 合并中它是「取消」，永远可点
         else:
@@ -1163,8 +1243,8 @@ class MainWindow(QMainWindow):
         # 会被 add_paths 的重入保护挡回去，白选一趟还提示「没有可添加的视频」
         self.btn_folder.setEnabled(not self._merging and not self._adding)
         self.folder_label.setText(
-            f'共 {n} 个片段，来自「{self._src_name}」' if n and self._src_name
-            else (f'共 {n} 个片段' if n
+            f'来自「{self._src_name}」 · 可拖动调序，Delete 移除选中' if n and self._src_name
+            else ('可拖动调序，Delete 移除选中' if n
                   else '把视频或文件夹拖进来（或点右边添加文件夹）'))
         self.out_dir_label.setText(_short_path(self._out_dir) if self._out_dir else '—')
         self.out_dir_label.setToolTip(str(self._out_dir) if self._out_dir else '')
@@ -1347,22 +1427,47 @@ class MainWindow(QMainWindow):
         self._merging = True
         self._set_merge_mode(True)
         self.progress_bar.setVisible(True)
-        self.status.setText('正在合并，请稍候...')
+        self._stage, self._pct, self._t0 = '正在合并', -1, None
+        self.status.setText('正在合并…')
 
-        self.worker = MergeWorker(files, output, total_dur, expect_dur, fix_tb)
+        self.worker = MergeWorker(files, output, total_dur, expect_dur, fix_tb, secs)
         self.worker.progress.connect(self.on_progress)
-        self.worker.status.connect(self.status.setText)
+        self.worker.status.connect(self.on_stage)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
+
+    def on_stage(self, text):
+        """换阶段（统一时基 k/n → 合并 → 复核）：剩余时间按新阶段重算。"""
+        self._stage, self._pct, self._t0 = text, -1, None   # 上一阶段的百分比别带过来
+        self._show_progress()
 
     def on_progress(self, pct):
         if pct < 0:                       # 无法估算总时长 → 不确定进度（转圈）
             self.progress_bar.setRange(0, 0)
-            self.status.setText('正在合并，请稍候...')
         else:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(pct)
-            self.status.setText(f'正在合并… {pct}%')
+            if self._t0 is None:
+                self._t0 = (time.monotonic(), pct)
+        self._pct = pct
+        self._show_progress()
+
+    def _show_progress(self):
+        if self._merging and not self.btn_merge.isEnabled():
+            return                        # 正在取消，别把「正在取消…」顶掉
+        pct, text = self._pct, self._stage + '…'
+        if pct >= 0:
+            text += f' {pct}%'
+            # 几个 GB 的课程一合几分钟，光有百分比不知道要不要去倒杯水。
+            # 跑满 5 秒、推进过 2% 再估，开头那几秒的速度不准。
+            if self._t0:
+                t0, p0 = self._t0
+                dt, dp = time.monotonic() - t0, pct - p0
+                if dt > 5 and dp >= 2:
+                    left = dt / dp * (100 - pct)
+                    text += (f'  ·  约剩 {int(left // 60) + 1} 分钟' if left >= 60
+                             else '  ·  不到 1 分钟')
+        self.status.setText(text)
 
     def closeEvent(self, event):
         self._closing = True

@@ -1,0 +1,54 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install PyQt6 pyinstaller
+
+      # Windows 版 ffmpeg/ffprobe：gyan.dev 的 release essentials 静态版，下完对 sha256
+      - name: Fetch ffmpeg
+        shell: pwsh
+        run: |
+          $base = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+          Invoke-WebRequest $base -OutFile ff.zip
+          $want = (Invoke-WebRequest "$base.sha256").Content.Trim().Split(' ')[0]
+          $got = (Get-FileHash ff.zip -Algorithm SHA256).Hash
+          if ($got -ne $want.ToUpper()) { throw "ffmpeg sha256 不符: $got vs $want" }
+          Expand-Archive ff.zip -DestinationPath ff
+          $bin = Get-ChildItem ff -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $bin.FullName bin/
+          Copy-Item (Join-Path $bin.DirectoryName 'ffprobe.exe') bin/
+          ./bin/ffmpeg.exe -version | Select-Object -First 1
+
+      - name: Smoke test (real merge)
+        env:
+          PYTHONUTF8: '1'
+        run: python ci_smoke.py
+
+      - name: PyInstaller
+        run: pyinstaller --noconfirm merger.spec
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path merger.py -Pattern "^VERSION = '(.+)'").Matches[0].Groups[1].Value
+          Compress-Archive -Path "dist/Video Merge" -DestinationPath "Video Merge_${v}_windows.zip"
+          echo "ZIP=Video Merge_${v}_windows.zip" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: video-merge-windows
+          path: ${{ env.ZIP }}
