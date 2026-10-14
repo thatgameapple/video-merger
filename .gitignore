@@ -8,3 +8,4 @@ logo.png
 *.pyc
 .DS_Store
 # bin/ffmpeg+ffprobe（arm64 静态版，各 49MB）已入库，换机 clone 即用、不再缺二进制
+*_windows.zip
