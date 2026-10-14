@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QDialog, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QIcon
 
 VERSION = '1.6.1'
 AUTHOR = 'thatgameapple'
@@ -1561,6 +1561,12 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    # Windows 上 exe 内嵌的图标只管资源管理器；Qt 只认名为 IDI_ICON1 的资源，
+    # PyInstaller 嵌的不是这个名字，不显式设置的话标题栏/任务栏是空白默认图标。
+    if IS_WIN:
+        ico = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'AppIcon.ico'
+        if ico.is_file():
+            app.setWindowIcon(QIcon(str(ico)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

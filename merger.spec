@@ -29,7 +29,7 @@ a = Analysis(
     ['merger.py'],
     pathex=[],
     binaries=_binaries,
-    datas=[],
+    datas=[(os.path.join(SPECPATH, 'AppIcon.ico'), '.')] if _WIN else [],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
