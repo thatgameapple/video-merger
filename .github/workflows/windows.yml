@@ -5,6 +5,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -52,3 +55,16 @@ jobs:
         with:
           name: video-merge-windows
           path: ${{ env.ZIP }}
+
+      # 墙内连不上 artifact 用的 blob.core.windows.net，Release 资产那条通道是通的：
+      # 同一个包再挂到「win-test」预发布上（私库，不公开），每次覆盖成最新一份。
+      - name: Upload to win-test prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view win-test 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create win-test --prerelease --title "Windows 测试包（最新一次构建）" --notes "每次 Windows 构建自动覆盖，正式版见带版本号的 Release。"
+          }
+          gh release upload win-test "$env:ZIP" --clobber
