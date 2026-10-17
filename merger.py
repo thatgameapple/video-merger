@@ -1564,6 +1564,13 @@ def main():
     # Windows 上 exe 内嵌的图标只管资源管理器；Qt 只认名为 IDI_ICON1 的资源，
     # PyInstaller 嵌的不是这个名字，不显式设置的话标题栏/任务栏是空白默认图标。
     if IS_WIN:
+        # 任务栏按「这个窗口属于哪个程序」去找图标：不报一个固定身份，它就去系统缓存里
+        # 拿 exe 的旧图标或默认图标（标题栏正常、任务栏空白）。必须在建窗口之前报。
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('thatgameapple.videomerge')
+        except Exception:
+            pass
         ico = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'AppIcon.ico'
         if ico.is_file():
             app.setWindowIcon(QIcon(str(ico)))
