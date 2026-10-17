@@ -1558,6 +1558,33 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, '错误', f'合并失败：\n{msg}')
 
 
+def _set_class_icon(win):
+    """有的 Windows 环境（实测 Parallels 里的 Win11）任务栏不用程序设的图标，取的是窗口类
+    自带的那个——Qt 在 exe 里找不到名为 IDI_ICON1 的资源，给的是系统默认的白窗口图标。
+    窗口显示前把类图标换成 exe 里嵌的那个（PyInstaller --icon 嵌的资源号是 1）。
+    同一类窗口共用这个图标，换一次就够。跑源码时 exe 是 python.exe，不动。"""
+    if not (IS_WIN and getattr(sys, 'frozen', False)):
+        return
+    try:
+        import ctypes
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        vp = ctypes.c_void_p
+        k.GetModuleHandleW.restype = vp
+        u.LoadImageW.restype = vp
+        u.LoadImageW.argtypes = [vp, vp, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetClassLongPtrW.restype = vp
+        u.SetClassLongPtrW.argtypes = [vp, ctypes.c_int, vp]
+        exe = k.GetModuleHandleW(None)
+        hwnd = int(win.winId())      # 先把原生窗口建出来（窗口类在这时注册），此时还没显示
+        for slot, metric in ((-14, 11), (-34, 49)):   # 大图标 GCLP_HICON/SM_CXICON，小图标 GCLP_HICONSM/SM_CXSMICON
+            n = u.GetSystemMetrics(metric)
+            h = u.LoadImageW(exe, 1, 1, n, n, 0)       # 资源号 1、IMAGE_ICON
+            if h:
+                u.SetClassLongPtrW(hwnd, slot, h)
+    except Exception:
+        pass
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
@@ -1575,6 +1602,7 @@ def main():
         if ico.is_file():
             app.setWindowIcon(QIcon(str(ico)))
     win = MainWindow()
+    _set_class_icon(win)
     win.show()
     sys.exit(app.exec())
 
